@@ -37,7 +37,9 @@ services:
     depends_on:
       - backend
     environment:
-      NEXT_PUBLIC_API_URL: http://backend:8000
+      # NEXT_PUBLIC_* is inlined into the browser bundle, so it must be the
+      # host-reachable URL — not the docker-internal `backend` hostname.
+      NEXT_PUBLIC_API_URL: http://localhost:8000
     restart: unless-stopped
 
 volumes:

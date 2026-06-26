@@ -28,22 +28,28 @@ _AAVE_POOL_ABI: list[dict[str, Any]] = [
         "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
         "name": "getReserveData",
         "outputs": [
-            {
-                "components": [{"internalType": "uint256", "name": "data", "type": "uint256"}],
-                "internalType": "struct DataTypes.ReserveConfigurationMap",
-                "name": "",
-                "type": "tuple",
-            },
+            # ReserveConfigurationMap is a single-field uint256 struct that
+            # ABI-encodes inline as a plain uint256 (no offset word). Declaring
+            # it as `uint256` (not a tuple) is what web3/eth_abi can decode.
+            # This mirrors the on-chain DataTypes.ReserveDataLegacy struct: `id`
+            # is a uint16 sitting BETWEEN lastUpdateTimestamp and the addresses,
+            # followed by three trailing uint128s. Field order/count must match
+            # exactly or eth_abi reads each slot from the wrong offset.
+            {"internalType": "uint256", "name": "configuration", "type": "uint256"},
             {"internalType": "uint128", "name": "liquidityIndex", "type": "uint128"},
             {"internalType": "uint128", "name": "currentLiquidityRate", "type": "uint128"},
+            {"internalType": "uint128", "name": "variableBorrowIndex", "type": "uint128"},
             {"internalType": "uint128", "name": "currentVariableBorrowRate", "type": "uint128"},
             {"internalType": "uint128", "name": "currentStableBorrowRate", "type": "uint128"},
             {"internalType": "uint40", "name": "lastUpdateTimestamp", "type": "uint40"},
+            {"internalType": "uint16", "name": "id", "type": "uint16"},
             {"internalType": "address", "name": "aTokenAddress", "type": "address"},
             {"internalType": "address", "name": "stableDebtTokenAddress", "type": "address"},
             {"internalType": "address", "name": "variableDebtTokenAddress", "type": "address"},
             {"internalType": "address", "name": "interestRateStrategyAddress", "type": "address"},
-            {"internalType": "uint8", "name": "id", "type": "uint8"},
+            {"internalType": "uint128", "name": "accruedToTreasury", "type": "uint128"},
+            {"internalType": "uint128", "name": "unbacked", "type": "uint128"},
+            {"internalType": "uint128", "name": "isolationModeTotalDebt", "type": "uint128"},
         ],
         "stateMutability": "view",
         "type": "function",
@@ -70,6 +76,7 @@ _ReserveData = namedtuple(
         "configuration_data",
         "liquidity_index",
         "liquidity_rate",
+        "variable_borrow_index",
         "variable_borrow_rate",
         "stable_borrow_rate",
         "last_update_timestamp",
@@ -119,9 +126,7 @@ class AaveV3Adapter:
     ) -> None:
         self.w3 = Web3(Web3.HTTPProvider(rpc_url))
         self.pool_address = Web3.to_checksum_address(pool_address)
-        self.pool: Contract = self.w3.eth.contract(
-            address=self.pool_address, abi=_AAVE_POOL_ABI
-        )
+        self.pool: Contract = self.w3.eth.contract(address=self.pool_address, abi=_AAVE_POOL_ABI)
         # {symbol: checksummed_address}
         self.assets: dict[str, str] = {
             sym: Web3.to_checksum_address(addr) for sym, addr in assets.items()
@@ -161,9 +166,7 @@ class AaveV3Adapter:
 
         # Filter to tracked assets that actually exist in the pool
         tracked = {
-            sym: addr
-            for sym, addr in self.assets.items()
-            if addr.lower() in all_reserves_lower
+            sym: addr for sym, addr in self.assets.items() if addr.lower() in all_reserves_lower
         }
 
         if not tracked:
@@ -187,27 +190,21 @@ class AaveV3Adapter:
             lambda: self.pool.functions.getReserveData(address).call()
         )
 
-        # Unpack: first element is a struct {data: uint256}
-        config_struct = raw_tuple[0]
-        if hasattr(config_struct, "data"):
-            config_data: int = config_struct.data
-        elif isinstance(config_struct, (tuple, list)):
-            config_data = int(config_struct[0])
-        else:
-            config_data = int(config_struct)
-
+        # configuration is decoded as a plain uint256 now (ABI fixed). The first
+        # element of raw_tuple is the config bitmask directly.
         rd = _ReserveData(
-            configuration_data=config_data,
+            configuration_data=int(raw_tuple[0]),
             liquidity_index=raw_tuple[1],
             liquidity_rate=raw_tuple[2],
-            variable_borrow_rate=raw_tuple[3],
-            stable_borrow_rate=raw_tuple[4],
-            last_update_timestamp=raw_tuple[5],
-            a_token_address=raw_tuple[6],
-            stable_debt_token_address=raw_tuple[7],
-            variable_debt_token_address=raw_tuple[8],
-            interest_rate_strategy_address=raw_tuple[9],
-            reserve_id=raw_tuple[10],
+            variable_borrow_index=raw_tuple[3],
+            variable_borrow_rate=raw_tuple[4],
+            stable_borrow_rate=raw_tuple[5],
+            last_update_timestamp=raw_tuple[6],
+            reserve_id=raw_tuple[7],
+            a_token_address=raw_tuple[8],
+            stable_debt_token_address=raw_tuple[9],
+            variable_debt_token_address=raw_tuple[10],
+            interest_rate_strategy_address=raw_tuple[11],
         )
 
         # Fetch token supplies
@@ -242,6 +239,7 @@ class AaveV3Adapter:
             },
             "liquidity_index": str(rd.liquidity_index),
             "liquidity_rate_ray": str(rd.liquidity_rate),
+            "variable_borrow_index": str(rd.variable_borrow_index),
             "variable_borrow_rate_ray": str(rd.variable_borrow_rate),
             "stable_borrow_rate_ray": str(rd.stable_borrow_rate),
             "last_update_timestamp": rd.last_update_timestamp,

@@ -3,10 +3,24 @@
 Layers over ranker.score_opportunities() output to produce:
   rating (0-100, relative min-max), rating_label, confidence (0-100), medal.
 
-Each input opp must carry:
-  score        — float, from score_opportunities()
-  _protocol    — str, lowercase protocol name (wired by task-04)
-  _history_points — int, number of history snapshots for this market (task-04)
+Confidence completeness is driven by REAL collected signals attached to each
+opp dict by the API route (which reads the Protocol row + a real history-depth
+query):
+
+  _protocol_age_days : float | None  days since on-chain deployment, from the
+                      ProtocolAgeCollector (binary-search of get_code). None =
+                      unknown / not resolvable (e.g. non-EVM protocols like
+                      Hyperliquid) -> 1 completeness stub.
+  _audit_count      : int            known audit count from the
+                      ProtocolAuditCollector (DefiLlama presence today).
+                      <= 0 -> 1 stub.
+  _persistence_days  : int            distinct calendar days with snapshots in
+                      the last 30d. < CONFIDENCE_PERSISTENCE_MIN_DAYS -> 1 stub.
+  _history_points   : int            total snapshots in the last 30d; drives the
+                      depth factor (min(1, n / CONFIDENCE_VOLATILITY_WINDOW)).
+
+The former static PROTOCOL_METADATA heuristic table is gone — completeness now
+reflects what the scanner has actually collected, not a hardcoded allowlist.
 """
 
 from __future__ import annotations
@@ -21,31 +35,19 @@ LABEL_FAIR = 40
 CONFIDENCE_BASE = 100
 CONFIDENCE_STUB_PENALTY = 0.15
 CONFIDENCE_COMPLETENESS_FLOOR = 0.4
-CONFIDENCE_VOLATILITY_WINDOW = 20  # N — matches DEFI_VOLATILITY_WINDOW default
-
-# ── Protocol metadata ─────────────────────────────────────────────────────────
-# ponytail: static placeholder until a real protocol-metadata collector exists.
-# Keys: protocol SLUG (lowercased first token of the registered name) →
-#   {"age_known": bool, "audit_known": bool}. Protocols register with display
-#   names like "Aave V3" / "Hyperliquid"; _protocol_slug() maps those to keys.
-# Protocols absent from this map default to age_known=False, audit_known=False.
-PROTOCOL_METADATA: dict[str, dict[str, bool]] = {
-    "aave": {"age_known": True, "audit_known": True},
-    "compound": {"age_known": True, "audit_known": True},
-    "hyperliquid": {"age_known": True, "audit_known": False},
-    "gmx": {"age_known": True, "audit_known": True},
-    "uniswap": {"age_known": True, "audit_known": True},
-}
+CONFIDENCE_VOLATILITY_WINDOW = 20  # N snapshots for full depth (matches vol window)
+CONFIDENCE_PERSISTENCE_MIN_DAYS = 7  # distinct observation days for persistence_known
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def _protocol_slug(name: str) -> str:
-    """Map a registered protocol name to its metadata key.
+    """Map a registered protocol display name to its canonical slug key.
 
-    Display names ("Aave V3", "Hyperliquid") → lowercased first token
-    ("aave", "hyperliquid"). Empty/blank names → "".
+    Display names ("Aave V3", "Hyperliquid") -> lowercased first token
+    ("aave", "hyperliquid"). Empty/blank names -> "". Shared by the audit
+    collector (matches DefiLlama entries by this slug) and tests.
     """
     parts = name.split()
     return parts[0].lower() if parts else ""
@@ -63,20 +65,30 @@ def rating_label(rating: float) -> str:
     return "Avoid"
 
 
-def _confidence(protocol: str, history_points: int) -> float:
-    """Compute confidence 0-100.
+def _confidence(
+    protocol_age_days: float | None,
+    audit_count: int,
+    history_points: int,
+    persistence_days: int,
+) -> float:
+    """Compute confidence 0-100 from real collected signals.
 
-    completeness_factor: 1.0 - (0.15 × stubbed_count), floor 0.4.
-    Stubbed inputs: age_known=False, audit_known=False, persistence (always stubbed).
-    depth_factor: min(1.0, n / N).
+    Stubbed inputs (each penalises completeness by CONFIDENCE_STUB_PENALTY,
+    floored at CONFIDENCE_COMPLETENESS_FLOOR):
+      - protocol_age_days is None        (deployment unknown / not resolvable)
+      - audit_count <= 0                (no known audits)
+      - persistence_days < MIN          (thin / bursty observation history)
+
+    Depth factor: min(1.0, history_points / CONFIDENCE_VOLATILITY_WINDOW) —
+    confidence grows toward 1.0 as we accumulate snapshots.
     """
-    meta = PROTOCOL_METADATA.get(_protocol_slug(protocol), {})
     stubs = 0
-    if not meta.get("age_known", False):
+    if protocol_age_days is None:
         stubs += 1
-    if not meta.get("audit_known", False):
+    if audit_count <= 0:
         stubs += 1
-    stubs += 1  # persistence always stubbed
+    if persistence_days < CONFIDENCE_PERSISTENCE_MIN_DAYS:
+        stubs += 1
 
     completeness = max(CONFIDENCE_COMPLETENESS_FLOOR, 1.0 - stubs * CONFIDENCE_STUB_PENALTY)
     depth = min(1.0, history_points / CONFIDENCE_VOLATILITY_WINDOW)
@@ -90,8 +102,9 @@ def rate_opportunities(scored: list[dict]) -> list[dict]:
     """Attach rating, rating_label, confidence, medal to each scored opp.
 
     Args:
-        scored: output of score_opportunities() — each dict must have 'score',
-                '_protocol', '_history_points'.
+        scored: output of score_opportunities() — each dict must have 'score'
+                and the four real confidence signals (_protocol_age_days,
+                _audit_count, _history_points, _persistence_days).
 
     Returns:
         Same list with rating/rating_label/confidence/medal added in-place.
@@ -112,8 +125,10 @@ def rate_opportunities(scored: list[dict]) -> list[dict]:
             opp["rating"] = (float(opp["score"]) - min_s) / rng * 100.0
         opp["rating_label"] = rating_label(opp["rating"])
         opp["confidence"] = _confidence(
-            opp.get("_protocol", ""),
-            int(opp.get("_history_points", 0)),
+            protocol_age_days=opp.get("_protocol_age_days"),
+            audit_count=int(opp.get("_audit_count", 0) or 0),
+            history_points=int(opp.get("_history_points", 0) or 0),
+            persistence_days=int(opp.get("_persistence_days", 0) or 0),
         )
 
     # Sort by rating desc to assign medals

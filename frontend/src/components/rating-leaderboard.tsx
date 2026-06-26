@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import {
   Table,
   TableBody,
@@ -11,8 +10,9 @@ import {
 } from "@/components/ui/table";
 import { getRiskLabel, getRiskColor } from "@/components/opportunity-card";
 import { useCapital, yieldToDollars } from "@/lib/capital-context";
-import { getOpportunities, isLoop, oppYield } from "@/lib/api";
+import { isLoop, oppYield } from "@/lib/api";
 import type { LoopOpportunityOut, CarryOpportunityOut } from "@/lib/api";
+import { useOpportunities } from "@/lib/opportunities-context";
 import { fmtPct, fmtUsd } from "@/lib/utils";
 
 type Opp = LoopOpportunityOut | CarryOpportunityOut;
@@ -28,22 +28,12 @@ export default function RatingLeaderboard({
   onOpenDetail?: (opp: Opp) => void;
 }) {
   const { capital } = useCapital();
-  const [opps, setOpps] = useState<Opp[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setLoading(true);
-    // type defaults to "all": the API rerates the merged set on one scale and
-    // returns it score-desc (== rating-desc), so the top `limit` are already the
-    // top-rated, in order — no client re-sort needed.
-    getOpportunities({ sort: "return", limit: 10 })
-      .then(setOpps)
-      .catch((e: unknown) =>
-        setError(e instanceof Error ? e.message : String(e))
-      )
-      .finally(() => setLoading(false));
-  }, []);
+  // Derived from the page-level OpportunitiesProvider (single shared fetch).
+  // The API rerates the merged type=all set on one scale and returns it
+  // score-desc (== rating-desc), so the first 10 of the shared sort=return set
+  // are the top-rated, in order — no client re-sort needed.
+  const { opps: allOpps, loading, error } = useOpportunities();
+  const opps = allOpps.slice(0, 10);
 
   return (
     <div className="rounded-xl border bg-card p-4 shadow-sm">

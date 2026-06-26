@@ -74,6 +74,29 @@ async def run_collectors() -> None:
     )
     _tasks.append(task)
 
+    # ── Protocol metadata collectors (real confidence signals) ───────────────
+    # Audit presence + contract address from DefiLlama; on-chain deployment
+    # timestamp via get_code binary search. Refreshed hourly — deploy/audit
+    # info changes rarely, so this keeps free-RPC rate limits happy.
+    from app.collectors.protocol_metadata import (
+        ProtocolAgeCollector,
+        ProtocolAuditCollector,
+    )
+
+    audit = ProtocolAuditCollector(async_session_factory)
+    task = asyncio.create_task(
+        _run_loop(audit.collect, settings.DEFI_PROTOCOL_METADATA_INTERVAL_SECONDS),
+        name="protocol-audit-collector",
+    )
+    _tasks.append(task)
+
+    age = ProtocolAgeCollector(async_session_factory)
+    task = asyncio.create_task(
+        _run_loop(age.collect, settings.DEFI_PROTOCOL_METADATA_INTERVAL_SECONDS),
+        name="protocol-age-collector",
+    )
+    _tasks.append(task)
+
     # ── Alert engine ──────────────────────────────────────────────────────
     from app.alerts import run_alerts
 

@@ -1,4 +1,11 @@
-"""Tests for rate_opportunities — the Rating Engine (TDD)."""
+"""Tests for rate_opportunities — the Rating Engine (TDD).
+
+Confidence now drives off REAL collected signals (see rating.py docstring):
+  _protocol_age_days, _audit_count, _history_points, _persistence_days.
+The factory `_opp` defaults to fully-stubbed (age=None, audit=0,
+persistence=0) so the inherited non-confidence assertions stay meaningful;
+per-test overrides exercise specific real inputs.
+"""
 
 from __future__ import annotations
 
@@ -8,12 +15,18 @@ from app.calculations.rating import rate_opportunities, rerate_combined
 
 
 def _opp(**overrides) -> dict:
-    """Factory for a pre-scored opportunity dict (ranker output shape)."""
+    """Factory for a pre-scored opportunity dict (ranker output shape).
+
+    Defaults: score=5, _history_points=20, all confidence signals stubbed.
+    """
     defaults = {
         "score": 5.0,
         "rank": 1,
-        "_protocol": "aave",
+        "_protocol": "aave",  # identity only; confidence no longer reads it
         "_history_points": 20,
+        "_protocol_age_days": None,   # unknown -> stub
+        "_audit_count": 0,            # no audits known -> stub
+        "_persistence_days": 0,       # thin -> stub
     }
     return {**defaults, **overrides}
 
@@ -22,7 +35,7 @@ def _opp(**overrides) -> dict:
 
 
 def test_relative_rating_top_is_100_bottom_is_0_monotonic():
-    """Distinct scores → top opp gets rating=100, bottom gets 0, monotonic."""
+    """Distinct scores -> top opp gets rating=100, bottom gets 0, monotonic."""
     opps = [
         _opp(score=1.0),
         _opp(score=3.0),
@@ -33,15 +46,14 @@ def test_relative_rating_top_is_100_bottom_is_0_monotonic():
     ratings = sorted([r["rating"] for r in result])
     assert ratings[0] == pytest.approx(0.0)
     assert ratings[-1] == pytest.approx(100.0)
-    # monotonic: each step is non-decreasing
     assert all(ratings[i] <= ratings[i + 1] for i in range(len(ratings) - 1))
 
 
-# ── 2. All-equal batch → all 100, no divide-by-zero ─────────────────────────
+# ── 2. All-equal batch -> all 100, no divide-by-zero ─────────────────────────
 
 
 def test_all_equal_scores_all_get_rating_100():
-    """Same score for every opp → all get rating=100 (no ZeroDivisionError)."""
+    """Same score for every opp -> all get rating=100 (no ZeroDivisionError)."""
     opps = [_opp(score=4.0) for _ in range(3)]
     result = rate_opportunities(opps)
 
@@ -54,85 +66,95 @@ def test_all_equal_scores_all_get_rating_100():
 
 @pytest.mark.parametrize("rating,expected_label", [
     (90, "Excellent"),
-    (85, "Excellent"),   # boundary: ≥85
+    (85, "Excellent"),   # boundary: >=85
     (72, "Very Good"),
-    (70, "Very Good"),   # boundary: ≥70
+    (70, "Very Good"),   # boundary: >=70
     (56, "Good"),
-    (55, "Good"),        # boundary: ≥55
+    (55, "Good"),        # boundary: >=55
     (41, "Fair"),
-    (40, "Fair"),        # boundary: ≥40
+    (40, "Fair"),        # boundary: >=40
     (30, "Avoid"),
     (39, "Avoid"),       # just below Fair boundary
 ])
 def test_label_thresholds(rating, expected_label):
     """rating value maps to expected label via thresholds."""
-    # Force a two-opp batch so min-max produces the desired rating for opp[0].
-    # opp[0] gets rating = (5 - 0) / (5 - 0) * 100 = 100; we test labels directly
-    # by constructing a batch where the target rating falls out of min-max.
-    # Simpler: single-opp batch (all equal) → rating=100, label=Excellent.
-    # Instead, inject rating directly by controlling scores to produce the value.
-    #
-    # Two opps: scores 0 and X → ratings 0 and 100.
-    # For an arbitrary rating R, use scores 0 and 1 for the reference pair,
-    # but we can also test label_from_rating separately by inspecting a result
-    # that directly produces the target.
-    #
-    # Cleanest: single opp (equal batch) → 100 → Excellent. That only tests one label.
-    # Use a 3-opp batch: scores 0, rating, 100 (scaled as raw scores).
     opps = [
         _opp(score=0.0),
         _opp(score=float(rating)),
         _opp(score=100.0),
     ]
     result = rate_opportunities(opps)
-    # Find the opp whose rating matches our target value (score == rating here)
     middle = next(r for r in result if r["score"] == float(rating))
     assert middle["rating"] == pytest.approx(float(rating))
     assert middle["rating_label"] == expected_label
 
 
-# ── 4. Confidence penalises more stubbed inputs ───────────────────────────────
+# ── 4. Confidence completeness ladder — one penalty per unknown signal ─────
 
 
-def test_confidence_penalises_more_stubbed_inputs():
-    """Opp with unknown age+audit has lower confidence than one with known age+audit (depth equal)."""
-    # "compound" not in PROTOCOL_METADATA → age/audit unknown → more stubs
-    # "aave" in PROTOCOL_METADATA with age_known=True, audit_known=True → fewer stubs
-    opps = [
-        _opp(score=5.0, _protocol="aave", _history_points=20),        # fewer stubs
-        _opp(score=5.0, _protocol="unknown_protocol_xyz", _history_points=20),  # more stubs
-    ]
+def test_confidence_zero_stubs_at_full_depth_is_100():
+    """All real signals present + history_points >= window -> confidence 100."""
+    opps = [_opp(_protocol_age_days=1000.0, _audit_count=3, _persistence_days=25)]
     result = rate_opportunities(opps)
-
-    aave_conf = next(r for r in result if r["_protocol"] == "aave")["confidence"]
-    unknown_conf = next(r for r in result if r["_protocol"] == "unknown_protocol_xyz")["confidence"]
-    assert aave_conf > unknown_conf
+    assert result[0]["confidence"] == pytest.approx(100.0)
 
 
-# ── 5. Confidence penalises thin history ─────────────────────────────────────
+def test_confidence_ladder_one_two_three_stubs():
+    """Completeness = 0.85 / 0.70 / 0.55 at full depth for 1/2/3 stubs."""
+    one = rate_opportunities([_opp(_protocol_age_days=None, _audit_count=3, _persistence_days=25)])
+    two = rate_opportunities([_opp(_protocol_age_days=None, _audit_count=0, _persistence_days=25)])
+    three = rate_opportunities([_opp()])  # defaults: all stubbed
+    assert one[0]["confidence"] == pytest.approx(85.0)
+    assert two[0]["confidence"] == pytest.approx(70.0)
+    assert three[0]["confidence"] == pytest.approx(55.0)
+
+
+# ── 5. Confidence penalises thin history (depth) ────────────────────────────
 
 
 def test_confidence_penalises_thin_history():
-    """Same stubbed inputs, n=4 vs n=20 → ~11 vs ~55 confidence (PRD example)."""
-    opps = [
-        _opp(score=5.0, _protocol="unknown_protocol_xyz", _history_points=4),
-        _opp(score=5.0, _protocol="unknown_protocol_xyz", _history_points=20),
-    ]
-    result = rate_opportunities(opps)
-
-    thin = next(r for r in result if r["_history_points"] == 4)
-    mature = next(r for r in result if r["_history_points"] == 20)
-
-    # PRD example: all-stubbed (3 penalties), n=4 → ~11; n=20 → ~55
-    assert thin["confidence"] == pytest.approx(11.0, abs=0.5)
-    assert mature["confidence"] == pytest.approx(55.0, abs=0.5)
+    """Fully stubbed completeness, depth 4/20 vs 20/20 -> ~11 vs ~55."""
+    thin = rate_opportunities([_opp(_history_points=4)])
+    mature = rate_opportunities([_opp(_history_points=20)])
+    assert thin[0]["confidence"] == pytest.approx(11.0, abs=0.5)
+    assert mature[0]["confidence"] == pytest.approx(55.0, abs=0.5)
 
 
-# ── 6. Medals for top 3 ───────────────────────────────────────────────────────
+def test_confidence_depth_scales_with_history_points():
+    """At 0 stubs, depth = n/window -> confidence follows it."""
+    q = rate_opportunities([_opp(_history_points=10, _protocol_age_days=1000.0,
+                                 _audit_count=3, _persistence_days=25)])
+    full = rate_opportunities([_opp(_history_points=20, _protocol_age_days=1000.0,
+                                    _audit_count=3, _persistence_days=25)])
+    # 10/20 = 0.5 depth * 1.0 completeness -> 50.0
+    assert q[0]["confidence"] == pytest.approx(50.0, abs=0.5)
+    assert full[0]["confidence"] == pytest.approx(100.0)
+
+
+# ── 6. Real signals beat stubbed (the slug regression's replacement) ───────
+
+
+def test_confidence_real_age_and_audit_remove_stubs():
+    """Known age + audits + sufficient persistence lift confidence above fully-stubbed.
+
+    Replaces the prior slug-resolution test: completeness is now driven by real
+    collected signals, not a static per-protocol allowlist, so the same protocol
+    name yields different confidence depending on what the collectors have filled.
+    """
+    stubbed = rate_opportunities([_opp(_protocol="Aave V3")])[0]["confidence"]
+    real = rate_opportunities(
+        [_opp(_protocol="Aave V3", _protocol_age_days=1000.0, _audit_count=2, _persistence_days=25)]
+    )[0]["confidence"]
+    assert stubbed == pytest.approx(55.0, abs=0.5)  # 3 stubs, full depth
+    assert real == pytest.approx(100.0)            # 0 stubs, full depth
+    assert real > stubbed
+
+
+# ── 7. Medals for top 3 ───────────────────────────────────────────────────────
 
 
 def test_medals_top_3_get_medals_others_none():
-    """Top 3 by rating get 🥇🥈🥉; 4th+ get None."""
+    """Top 3 by rating get medals; 4th+ get None."""
     opps = [
         _opp(score=1.0),
         _opp(score=2.0),
@@ -146,21 +168,6 @@ def test_medals_top_3_get_medals_others_none():
     assert by_rating[1]["medal"] == "🥈"
     assert by_rating[2]["medal"] == "🥉"
     assert by_rating[3]["medal"] is None
-
-
-# ── 7. Protocol slug resolves real registered display names ──────────────────
-
-
-def test_confidence_resolves_display_name_to_slug():
-    """Registered name 'Aave V3' must resolve to 'aave' metadata, not miss.
-
-    Regression: maps are keyed by slug; routes pass the full display name. With
-    age+audit known, only persistence is stubbed → completeness 0.85, depth 1.0
-    → confidence 85 (NOT the 55 a metadata miss would produce).
-    """
-    opps = [_opp(score=5.0, _protocol="Aave V3", _history_points=20)]
-    result = rate_opportunities(opps)
-    assert result[0]["confidence"] == pytest.approx(85.0, abs=0.5)
 
 
 # ── 8. rerate_combined: one shared scale + unique medals across merged set ───
@@ -181,10 +188,8 @@ def test_rerate_combined_shared_scale_and_unique_medals():
     opps = [_RatedObj(1.0), _RatedObj(5.0), _RatedObj(3.0), _RatedObj(2.0)]
     rerate_combined(opps)
 
-    # One shared scale: top score → 100, bottom → 0.
     assert max(o.rating for o in opps) == pytest.approx(100.0)
     assert min(o.rating for o in opps) == pytest.approx(0.0)
-    # Exactly one of each medal, gold on the highest score.
     medals = sorted(o.medal for o in opps if o.medal)
     assert medals == sorted(["🥇", "🥈", "🥉"])
     assert next(o for o in opps if o.medal == "🥇").score == 5.0

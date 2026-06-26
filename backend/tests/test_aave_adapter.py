@@ -83,14 +83,20 @@ def adapter(mock_web3_init):
     ]
     mock_rd = MagicMock()
     mock_rd.call.return_value = (
-        MagicMock(data=0),
-        10**27, 5 * 10**25, 3 * 10**25,
-        0, 1,
-        "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-        "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
-        "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        0,
+        0,  # configuration bitmask (plain uint256)
+        10**27, 5 * 10**25,
+        10**27,  # variableBorrowIndex
+        3 * 10**25,  # currentVariableBorrowRate
+        0,  # currentStableBorrowRate
+        1,  # lastUpdateTimestamp
+        0,  # id (uint16)
+        "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",  # aTokenAddress
+        "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",  # stableDebtTokenAddress
+        "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",  # variableDebtTokenAddress
+        "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",  # interestRateStrategyAddress
+        0,  # accruedToTreasury
+        0,  # unbacked
+        0,  # isolationModeTotalDebt
     )
     a.pool.functions.getReserveData.return_value = mock_rd
 
@@ -169,14 +175,20 @@ async def test_fetch_reserves_skips_failed_asset(adapter):
             raise ConnectionError("RPC timeout")
         mock_rd = MagicMock()
         mock_rd.call.return_value = (
-            MagicMock(data=0),
-            10**27, 5 * 10**25, 3 * 10**25,
-            0, 1,
-            "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-            "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
-            "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-            0,
+            0,  # configuration bitmask (plain uint256)
+            10**27, 5 * 10**25,
+            10**27,  # variableBorrowIndex
+            3 * 10**25,  # currentVariableBorrowRate
+            0,  # currentStableBorrowRate
+            1,  # lastUpdateTimestamp
+            0,  # id (uint16)
+            "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",  # aTokenAddress
+            "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",  # stableDebtTokenAddress
+            "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",  # variableDebtTokenAddress
+            "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",  # interestRateStrategyAddress
+            0,  # accruedToTreasury
+            0,  # unbacked
+            0,  # isolationModeTotalDebt
         )
         return mock_rd
 

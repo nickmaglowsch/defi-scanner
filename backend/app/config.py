@@ -9,6 +9,14 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://defi:defi@localhost:5432/defi_scanner"
     RPC_URL: str = "https://eth.llamarpc.com"
     HYPERLIQUID_API_URL: str = "https://api.hyperliquid.xyz"
+    # ── Protocol metadata collectors (real confidence signals) ───────────────
+    # DefiLlama's public /protocols list (no API key) supplies per-protocol
+    # `address`, `chain`, and audit presence. Override to point at a mirror or
+    # a local registry file served over HTTP for offline/test environments.
+    DEFI_LLAMA_PROTOCOLS_URL: str = "https://api.llama.fi/protocols"
+    # How often the metadata collectors refresh. Deploy/audit info changes
+    # rarely, so hourly is plenty and keeps free-RPC rate limits happy.
+    DEFI_PROTOCOL_METADATA_INTERVAL_SECONDS: int = 3600
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
     FRONTEND_ORIGIN: str = "http://localhost:3000"
@@ -28,6 +36,11 @@ class Settings(BaseSettings):
     )
     DEFI_VOLATILITY_WINDOW: int = 20
     ALERT_LOOP_YIELD_THRESHOLD: float = 10.0
+    # Loop opps with a nominal spread (deposit_apy − borrow_apy) below this floor
+    # are filtered out before scoring. 0.0 = require non-inverted rates (leverage
+    # can't manufacture yield from a negative pre-leverage edge); raise to demand
+    # a thicker pre-leverage margin for rate drift, gas, and fees.
+    DEFI_LOOP_MIN_NOMINAL_SPREAD: float = 0.0
     ALERT_FUNDING_RATE_THRESHOLD: float = 20.0
     ALERT_NET_CARRY_THRESHOLD: float = 12.0
     ALERT_BORROW_APY_THRESHOLD: float = 3.0

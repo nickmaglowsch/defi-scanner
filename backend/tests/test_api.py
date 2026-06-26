@@ -304,7 +304,8 @@ def test_get_looping_returns_opportunities(client, mock_db):
         id=MOCK_MARKET_ID, protocol_id=MOCK_PROTOCOL_ID, asset="USDC", market_type="lending"
     )
     protocol = SimpleNamespace(
-        id=MOCK_PROTOCOL_ID, name="Aave V3", type="lending", chain="ethereum", risk_score=0.5
+        id=MOCK_PROTOCOL_ID, name="Aave V3", type="lending", chain="ethereum", risk_score=0.5,
+        deployed_at=None, audit_count=0,
     )
     calc = _loop_calc_row()
 
@@ -316,14 +317,19 @@ def test_get_looping_returns_opportunities(client, mock_db):
     vol_result.all.return_value = []
     calc_result = MagicMock()
     calc_result.scalars.return_value.all.return_value = [calc]
-    # Task-04: two additional execute calls — get_yield_history + _volatility_map_lending
+    # Loop fetch execute order: history -> depth -> deposit_vol.
     history_result = MagicMock()
     history_result.all.return_value = []
+    depth_result = MagicMock()
+    depth_result.all.return_value = []
     deposit_vol_result = MagicMock()
     deposit_vol_result.all.return_value = []
 
     mock_db.execute = AsyncMock(
-        side_effect=[snap_result, mp_result, vol_result, calc_result, history_result, deposit_vol_result]
+        side_effect=[
+            snap_result, mp_result, vol_result, calc_result,
+            history_result, depth_result, deposit_vol_result,
+        ]
     )
 
     resp = client.get("/api/v1/looping")
@@ -362,13 +368,14 @@ def test_get_opportunities_with_limit(client, mock_db):
 def _loop_opportunity_mocks(snap=None, market=None, protocol=None, calc=None):
     """Return mock execute side-effects for one full _fetch_loop_opportunities call.
 
-    After task-04 the call order is:
+    Call order:
       1. snapshots (scalars)
       2. mp_rows (all)
       3. vol_map funding (all)       — existing volatility_penalty
       4. calc_result (scalars)
       5. history_result (all)        — get_yield_history
-      6. deposit_vol_result (all)    — _volatility_map_lending
+      6. depth_result (all)          — _history_depth_map (count, distinct_days)
+      7. deposit_vol_result (all)    — _volatility_map_lending
     """
     snap = snap or SimpleNamespace(
         id=MOCK_SNAPSHOT_ID,
@@ -387,7 +394,9 @@ def _loop_opportunity_mocks(snap=None, market=None, protocol=None, calc=None):
         id=MOCK_MARKET_ID, protocol_id=MOCK_PROTOCOL_ID, asset="USDC", market_type="lending"
     )
     protocol = protocol or SimpleNamespace(
-        id=MOCK_PROTOCOL_ID, name="Aave V3", type="lending", chain="ethereum", risk_score=0.5
+        id=MOCK_PROTOCOL_ID, name="Aave V3", type="lending", chain="ethereum", risk_score=0.5,
+        # real confidence-signal fields (getattr-safe in routes if absent, but explicit here)
+        deployed_at=None, audit_count=0,
     )
     calc = calc or _loop_calc_row()
 
@@ -409,11 +418,18 @@ def _loop_opportunity_mocks(snap=None, market=None, protocol=None, calc=None):
         (MOCK_MARKET_ID, 5.0, 4.8, 4.9, 4.7)
     ]
 
+    # _history_depth_map: (market_id, count, distinct_days)
+    depth_result = MagicMock()
+    depth_result.all.return_value = [(MOCK_MARKET_ID, 20, 25)]
+
     # _volatility_map_lending: (market_id, stddev)
     deposit_vol_result = MagicMock()
     deposit_vol_result.all.return_value = [(MOCK_MARKET_ID, 0.5)]
 
-    return [snap_result, mp_result, vol_result, calc_result, history_result, deposit_vol_result]
+    return [
+        snap_result, mp_result, vol_result, calc_result,
+        history_result, depth_result, deposit_vol_result,
+    ]
 
 
 def test_opportunities_response_includes_new_fields(client, mock_db):
@@ -458,10 +474,10 @@ def test_opportunities_rating_label_consistency(client, mock_db):
 def test_opportunities_sharpe_null_on_zero_volatility(client, mock_db):
     """Market with zero deposit volatility → sharpe: null, not an error."""
     mocks = _loop_opportunity_mocks()
-    # Override deposit_vol_result (index 5) to return zero volatility
+    # Override deposit_vol_result (now index 6) to return zero volatility.
     zero_vol = MagicMock()
     zero_vol.all.return_value = [(MOCK_MARKET_ID, 0.0)]
-    mocks[5] = zero_vol
+    mocks[6] = zero_vol
 
     mock_db.execute = AsyncMock(side_effect=mocks)
 
@@ -502,3 +518,234 @@ def test_opportunities_history_keys_present(client, mock_db):
     hist = data[0]["history"]
     for key in ("today", "yesterday", "avg_7d", "avg_30d"):
         assert key in hist, f"missing history key: {key}"
+
+
+# ── 7. Carry opps with no matching lending market are filtered (no real borrow leg) ─
+
+
+def _carry_opportunity_mocks_no_lending():
+    """Mock execute side-effects for _fetch_carry_opportunities where the funding
+    asset has NO lending market → must be filtered, not modeled at 0% borrow.
+
+    Carry fetch execute order when all opps are filtered (early return):
+      1. funding snapshots (scalars)
+      2. mp_rows (all)                  — (Market, Protocol)
+      3. latest_lending_by_asset (all)  — (LendingSnapshot, asset)  ← EMPTY
+      4. calcs (scalars)
+      5. vol_map (all)                  — _volatility_map (pre-loop)
+    """
+    snap = SimpleNamespace(
+        id=str(uuid4()),
+        market_id=MOCK_MARKET_ID,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        funding_rate=0.0001,
+        funding_interval_hours=1.0,
+        annualized_funding=8.76,
+        open_interest=1_000_000.0,
+        volume_24h=50_000_000.0,
+        long_short_ratio=1.5,
+        mark_price=100.0,
+        index_price=100.1,
+        raw_payload=None,
+    )
+    market = SimpleNamespace(
+        id=MOCK_MARKET_ID, protocol_id=MOCK_PROTOCOL_ID, asset="BTC", market_type="perp"
+    )
+    protocol = SimpleNamespace(
+        id=MOCK_PROTOCOL_ID, name="Hyperliquid", type="derivatives", chain="hyperliquid",
+        risk_score=0.3, deployed_at=None, audit_count=0,
+    )
+
+    snap_result = MagicMock()
+    snap_result.scalars.return_value.all.return_value = [snap]
+
+    mp_result = MagicMock()
+    mp_result.all.return_value = [(market, protocol)]
+
+    # _latest_lending_by_asset returns NO entry for "BTC" → no borrow leg.
+    lend_result = MagicMock()
+    lend_result.all.return_value = []
+
+    calc_result = MagicMock()
+    calc_result.scalars.return_value.all.return_value = []
+
+    vol_result = MagicMock()
+    vol_result.all.return_value = []
+
+    return [snap_result, mp_result, lend_result, calc_result, vol_result]
+
+
+def test_carry_opp_with_no_lending_market_is_filtered(client, mock_db):
+    """A perp asset with no matching lending market must not appear as a carry opp.
+
+    Regression: silently modeling a 0% borrow leg overstated net_carry for
+    assets the configured lending collectors don't cover (e.g. BTC perps with
+    only Aave USDC/USDT/DAI/WETH/wstETH lending). Now filtered at the source.
+    """
+    mock_db.execute = AsyncMock(side_effect=_carry_opportunity_mocks_no_lending())
+
+    resp = client.get("/api/v1/opportunities?type=carry")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def _carry_opportunity_mocks_with_lending():
+    """Mock execute side-effects for _fetch_carry_opportunities where the funding
+    asset HAS a lending market → must be returned with the real borrow_cost.
+
+    Carry fetch execute order (full path, one opp survives):
+      1. funding snapshots (scalars)
+      2. mp_rows (all)
+      3. latest_lending_by_asset (all)  — (LendingSnapshot, asset)  ← NON-EMPTY
+      4. calcs (scalars)
+      5. vol_map (all)
+      6. history (all)                  — get_yield_history
+      7. depth (all)                    — _history_depth_map
+    """
+    snap = SimpleNamespace(
+        id=str(uuid4()),
+        market_id=MOCK_MARKET_ID,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        funding_rate=0.0001,
+        funding_interval_hours=1.0,
+        annualized_funding=8.76,
+        open_interest=1_000_000.0,
+        volume_24h=50_000_000.0,
+        long_short_ratio=1.5,
+        mark_price=100.0,
+        index_price=100.1,
+        raw_payload=None,
+    )
+    market = SimpleNamespace(
+        id=MOCK_MARKET_ID, protocol_id=MOCK_PROTOCOL_ID, asset="USDC", market_type="perp"
+    )
+    protocol = SimpleNamespace(
+        id=MOCK_PROTOCOL_ID, name="Hyperliquid", type="derivatives", chain="hyperliquid",
+        risk_score=0.3, deployed_at=None, audit_count=0,
+    )
+    lend_snap = SimpleNamespace(
+        id=str(uuid4()),
+        market_id=str(uuid4()),
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        deposit_apy=5.0,
+        borrow_apy=3.0,
+        utilization=0.7,
+        available_liquidity=1_000_000.0,
+        total_supplied=5_000_000.0,
+        total_borrowed=3_500_000.0,
+        tvl=10_000_000.0,
+        raw_payload=None,
+    )
+
+    snap_result = MagicMock()
+    snap_result.scalars.return_value.all.return_value = [snap]
+
+    mp_result = MagicMock()
+    mp_result.all.return_value = [(market, protocol)]
+
+    # _latest_lending_by_asset returns (LendingSnapshot, asset) for "USDC".
+    lend_result = MagicMock()
+    lend_result.all.return_value = [(lend_snap, "USDC")]
+
+    calc_result = MagicMock()
+    calc_result.scalars.return_value.all.return_value = []
+
+    vol_result = MagicMock()
+    vol_result.all.return_value = []
+
+    history_result = MagicMock()
+    history_result.all.return_value = []
+
+    depth_result = MagicMock()
+    depth_result.all.return_value = []
+
+    return [
+        snap_result, mp_result, lend_result, calc_result,
+        vol_result, history_result, depth_result,
+    ]
+
+
+def test_carry_opp_with_lending_market_kept_and_borrows_real_cost(client, mock_db):
+    """A perp asset with a matching lending market is kept and carries the real
+    borrow_apy from that lending snapshot — not a 0% fallback."""
+    mock_db.execute = AsyncMock(side_effect=_carry_opportunity_mocks_with_lending())
+
+    resp = client.get("/api/v1/opportunities?type=carry")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    opp = data[0]
+    # Real borrow_apy 3.0 from the lending snapshot, not the 0.0 fallback.
+    assert opp["borrow_cost"] == pytest.approx(3.0)
+    assert opp["spot_yield"] == pytest.approx(5.0)
+
+
+# ── 8. Loop opps with inverted nominal spread are filtered (no real edge) ────
+
+
+def _loop_opportunity_mocks_inverted(snap=None, market=None, protocol=None, calc=None):
+    """Variant of _loop_opportunity_mocks where deposit < borrow: scanner must
+    not surface the opp no matter how leverage turns the post-leverage number
+    positive. Overrides only the snapshot's APY fields; rest inherits defaults."""
+    mocks = _loop_opportunity_mocks(snap=snap, market=market, protocol=protocol, calc=calc)
+    # Patch the snapshot (first side-effect, first scalars().all() payload) to be
+    # inverted: borrow > deposit. Existing default calc still has positive
+    # effective_yield — proving we filter off the nominal spread, NOT off the
+    # post-leverage effective_yield (the whole point of this regression).
+    inverted = SimpleNamespace(
+        id=MOCK_SNAPSHOT_ID,
+        market_id=MOCK_MARKET_ID,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        deposit_apy=3.19,   # < borrow_apy
+        borrow_apy=3.93,
+        utilization=0.7,
+        available_liquidity=1_000_000.0,
+        total_supplied=5_000_000.0,
+        total_borrowed=3_500_000.0,
+        tvl=10_000_000.0,
+        raw_payload=None,
+    )
+    mocks[0].scalars.return_value.all.return_value = [inverted]
+    return mocks
+
+
+def test_loop_opp_with_inverted_nominal_spread_is_filtered(client, mock_db):
+    """Loop with deposit < borrow must NOT surface — leverage manufacturing yield
+    from an inverted nominal spread isn't an economically attractive opp, even
+    when simulate_looping reports a positive effective_yield.
+
+    Regression baseline: the /opportunities?type=loop route already had a
+    `min_yield >= 0` filter, but it tested the post-leverage number. This test
+    pins the pre-leverage nominal-spread filter.
+    """
+    mock_db.execute = AsyncMock(side_effect=_loop_opportunity_mocks_inverted())
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_loop_opp_with_flat_zero_spread_is_kept(client, mock_db):
+    """A loop with deposit == borrow (zero nominal spread) is kept — the floor
+    is non-negative, not strictly positive."""
+    mocks = _loop_opportunity_mocks_inverted()
+    # Equal rates, not inverted.
+    flat = SimpleNamespace(
+        id=MOCK_SNAPSHOT_ID,
+        market_id=MOCK_MARKET_ID,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        deposit_apy=4.0,
+        borrow_apy=4.0,
+        utilization=0.7,
+        available_liquidity=1_000_000.0,
+        total_supplied=5_000_000.0,
+        total_borrowed=3_500_000.0,
+        tvl=10_000_000.0,
+        raw_payload=None,
+    )
+    mocks[0].scalars.return_value.all.return_value = [flat]
+    mock_db.execute = AsyncMock(side_effect=mocks)
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 1

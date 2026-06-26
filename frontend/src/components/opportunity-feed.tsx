@@ -17,6 +17,7 @@ import {
   type LoopOpportunityOut,
   type CarryOpportunityOut,
 } from "@/lib/api";
+import { useOpportunities } from "@/lib/opportunities-context";
 
 type AnyOpp = LoopOpportunityOut | CarryOpportunityOut;
 
@@ -33,8 +34,14 @@ export default function OpportunityFeed({
 }: {
   onOpenDetail?: (opp: AnyOpp) => void;
 }) {
+  // Shared base set from the page-level provider (sort=return, no filters, limit
+  // 50). When the UI controls are at their defaults, this IS the feed's query →
+  // reuse it and skip a duplicate fetch. Only diverge (own fetch) when a filter
+  // or sort that the base set wasn't built with is active.
+  const { opps: baseOpps, loading: baseLoading, error: baseError } = useOpportunities();
+
   const [data, setData] = useState<AnyOpp[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [typeFilter, setTypeFilter] = useState("");
@@ -45,6 +52,8 @@ export default function OpportunityFeed({
   const [assets, setAssets] = useState<string[]>([]);
   const [protocols, setProtocols] = useState<string[]>([]);
 
+  const isDefault = !typeFilter && !assetFilter && !protocolFilter && sort === "return";
+
   useEffect(() => {
     getAssets().then(setAssets).catch(() => {});
     getProtocols()
@@ -53,6 +62,8 @@ export default function OpportunityFeed({
   }, []);
 
   useEffect(() => {
+    if (isDefault) return; // served by the shared base set
+    let cancelled = false;
     setLoading(true);
     setError(null);
     getOpportunities({
@@ -62,10 +73,23 @@ export default function OpportunityFeed({
       sort,
       limit: 50,
     })
-      .then(setData)
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [typeFilter, assetFilter, protocolFilter, sort]);
+      .then((d) => {
+        if (!cancelled) setData(d);
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setError(e.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [typeFilter, assetFilter, protocolFilter, sort, isDefault]);
+
+  const displayData = isDefault ? baseOpps : data;
+  const displayLoading = isDefault ? baseLoading : loading;
+  const displayError = isDefault ? baseError : error;
 
   return (
     <div className="space-y-4">
@@ -146,22 +170,22 @@ export default function OpportunityFeed({
       </div>
 
       {/* States */}
-      {loading && (
+      {displayLoading && (
         <div className="py-8 text-center text-sm text-muted-foreground">Loading…</div>
       )}
-      {error && (
-        <div className="py-8 text-center text-sm text-destructive">{error}</div>
+      {displayError && (
+        <div className="py-8 text-center text-sm text-destructive">{displayError}</div>
       )}
-      {!loading && !error && data.length === 0 && (
+      {!displayLoading && !displayError && displayData.length === 0 && (
         <div className="py-8 text-center text-sm text-muted-foreground">
           No opportunities found.
         </div>
       )}
 
       {/* Cards */}
-      {!loading && !error && data.length > 0 && (
+      {!displayLoading && !displayError && displayData.length > 0 && (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {data.map((opp, i) => (
+          {displayData.map((opp, i) => (
             <OpportunityCard
               key={`${opp.protocol}-${opp.asset}-${i}`}
               opportunity={opp}

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -421,6 +421,16 @@ async def _fetch_loop_opportunities(
         if protocol_filter and protocol_filter.lower() not in protocol.name.lower():
             continue
 
+        # Economic-edge filter: skip loops whose nominal spread (deposit − borrow)
+        # is below the configured floor. A negative nominal spread means the only
+        # thing producing positive effective_yield is leverage amplifying an
+        # inverted rate — mathematically profitable but with no margin for rate
+        # drift, gas, or fees. Default 0.0 = require non-inverted rates; raise to
+        # demand a real pre-leverage edge.
+        nominal_spread = (snap.deposit_apy or 0.0) - (snap.borrow_apy or 0.0)
+        if nominal_spread < settings.DEFI_LOOP_MIN_NOMINAL_SPREAD:
+            continue
+
         max_ltv, liq_threshold = ltv_params_from_snapshot(snap)
         calc_row = calcs_by_snap.get(snap.id)
 
@@ -493,11 +503,12 @@ async def _fetch_loop_opportunities(
 
     ranked = score_opportunities(loop_opps, weights)
 
-    # Attach _history_points for confidence calculation (len of history entries).
-    # Fetch history aggregates (batched) for deposit_apy on lending_snapshots.
+    # Attach real confidence signals to each ranked opp.
     # ponytail: sequential, not asyncio.gather — a shared AsyncSession can't run
     # two queries concurrently. Use distinct sessions if this ever needs overlap.
     history_map = await get_yield_history(db, market_ids, "lending_snapshots", "deposit_apy")
+    # Real persistence/depth: snapshot count + distinct observation days (last 30d).
+    depth_map = await _history_depth_map(db, market_ids, "lending_snapshots")
 
     # Deposit APY volatility for Sharpe computation (batched).
     deposit_vol_map = await _volatility_map(db, market_ids, source="lending")
@@ -505,9 +516,12 @@ async def _fetch_loop_opportunities(
     for r in ranked:
         snap = r["_snap"]
         mid = snap.market_id
-        hist = history_map.get(mid, {})
-        # ponytail: count non-null avg_30d as proxy for data depth; fallback 0
-        r["_history_points"] = 1 if hist.get("avg_30d") is not None else 0
+        prot = protocols.get(mid)
+        cnt, days = depth_map.get(mid, (0, 0))
+        r["_history_points"] = cnt
+        r["_persistence_days"] = days
+        r["_protocol_age_days"] = _age_days(getattr(prot, "deployed_at", None))
+        r["_audit_count"] = getattr(prot, "audit_count", 0) or 0
 
     rate_opportunities(ranked)
 
@@ -626,7 +640,13 @@ async def _fetch_carry_opportunities(
         if protocol_filter and protocol_filter.lower() not in protocol.name.lower():
             continue
 
-        borrow_cost, spot_yield = lend_by_asset.get(market.asset, (0.0, 0.0))
+        # A carry trade needs a real borrow leg. If no lending market exists for
+        # this asset, borrow_cost/spot_yield are unknown — the opp isn't real,
+        # so skip it rather than silently modeling a 0% borrow (which would
+        # overstate net_carry vs. opps with a priced borrow leg).
+        if market.asset not in lend_by_asset:
+            continue
+        borrow_cost, spot_yield = lend_by_asset[market.asset]
 
         calc_row = calcs_by_snap.get(snap.id)
         if calc_row is None:
@@ -688,12 +708,18 @@ async def _fetch_carry_opportunities(
     history_map = await get_yield_history(
         db, market_ids, "funding_snapshots", "annualized_funding"
     )
+    # Real persistence/depth for carry markets (last 30d of funding snapshots).
+    depth_map = await _history_depth_map(db, market_ids, "funding_snapshots")
 
     for r in ranked:
         # _snap is not stored on carry opps — use market_id from the funding snap directly
         mid = r.get("_market_id", "")
-        hist = history_map.get(mid, {})
-        r["_history_points"] = 1 if hist.get("avg_30d") is not None else 0
+        prot = protocols.get(mid)
+        cnt, days = depth_map.get(mid, (0, 0))
+        r["_history_points"] = cnt
+        r["_persistence_days"] = days
+        r["_protocol_age_days"] = _age_days(getattr(prot, "deployed_at", None))
+        r["_audit_count"] = getattr(prot, "audit_count", 0) or 0
 
     rate_opportunities(ranked)
 
@@ -755,6 +781,50 @@ async def _latest_lending_by_asset(db: AsyncSession) -> dict[str, tuple[float, f
     out: dict[str, tuple[float, float]] = {}
     for snap, asset in lend_rows.all():
         out[asset] = (snap.borrow_apy or 0.0, snap.deposit_apy or 0.0)
+    return out
+
+
+def _age_days(deployed_at: object | None) -> float | None:
+    """Protocol deployment age in days, or None when unknown.
+
+    getattr-safe: protocol rows from older fixtures may lack the column.
+    """
+    if deployed_at is None:
+        return None
+    try:
+        return (datetime.now(UTC) - deployed_at).total_seconds() / 86400.0  # type: ignore[arg-type]
+    except TypeError:
+        return None
+
+
+# Trusted snapshot table names for the depth query — literal arg, never user input.
+_DEPTH_TABLES = {"lending_snapshots", "funding_snapshots"}
+
+
+async def _history_depth_map(
+    db: AsyncSession, market_ids: set[str], table: str
+) -> dict[str, tuple[int, int]]:
+    """Real confidence depth inputs per market: (snapshot_count, distinct_days) over last 30d.
+
+    `history_points` (count) drives the depth factor; `persistence_days`
+    (distinct calendar days) drives the persistence stub. Distinct from the
+    volatility STDDEV query — this measures spread over time, not variance.
+    """
+    if not market_ids or table not in _DEPTH_TABLES:
+        return {}
+    sql = text(f"""
+        SELECT market_id,
+               COUNT(*)                                            AS cnt,
+               COUNT(DISTINCT (observed_at AT TIME ZONE 'UTC')::date) AS days
+        FROM {table}
+        WHERE market_id = ANY(:market_ids)
+          AND observed_at >= NOW() - INTERVAL '30 days'
+        GROUP BY market_id
+    """)
+    result = await db.execute(sql, {"market_ids": list(market_ids)})
+    out: dict[str, tuple[int, int]] = {}
+    for mid, cnt, days in result.all():
+        out[mid] = (int(cnt or 0), int(days or 0))
     return out
 
 

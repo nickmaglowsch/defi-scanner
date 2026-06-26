@@ -1,8 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useOpportunities } from "@/lib/opportunities-context";
 import {
-  getOpportunities,
   isLoop,
   oppYield,
   type LoopOpportunityOut,
@@ -44,18 +43,10 @@ export type TerminalHeroProps = {
 };
 
 export default function TerminalHero({ onOpenDetail }: TerminalHeroProps) {
-  const [opps, setOpps] = useState<AnyOpp[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setLoading(true);
-    setError(null);
-    getOpportunities({ sort: "return", limit: 8 })
-      .then(setOpps)
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, []);
+  // Derived from the page-level OpportunitiesProvider (single shared fetch).
+  // Hero shows the top 8 by return == the first 8 of the shared sort=return set.
+  const { opps: allOpps, loading, error } = useOpportunities();
+  const opps = allOpps.slice(0, 8);
 
   return (
     <div className="rounded-md border border-zinc-700 bg-zinc-950 p-4 font-mono text-sm">
