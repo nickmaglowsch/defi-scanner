@@ -1,0 +1,6 @@
+# Task 05: Looping Simulator (TDD)
+
+- **Decisions**: APY inputs/outputs kept in percentage units (e.g., 5.0 = 5%) as specified — no internal conversion to decimal. The `net_apy` formula `(total_deposited * deposit_apy - total_borrowed * borrow_apy) / initial_capital` works directly in % space since both numerator and denominator cancel the 100× factor.
+- **Deviations**: Added 7 extra test cases beyond the 9 required (safety margin formula, risk score edge case, LTV clamping when target > max_ltv, effective_yield parity, leverage ratio verification, full keys check, input passthrough) to satisfy the ADEQUACY check. Added `deposit_apy`/`borrow_apy` to the test defaults dict to avoid redundant per-test overrides.
+- **Trade-offs**: The `LTV_USAGE_RATIO = 0.9` is not configurable per call — matches the task spec's "conservative default." If per-protocol LTV usage ratios are needed, add as a parameter later.
+- **Risks**: The convergence is asymptotic — with very tight safety buffers and low `ltv_used`, `max_loops` may terminate before reaching target. Callers should use generous `max_loops` (≥20) for precision. Zero `liquidation_threshold` with non-zero capital produces a `liquidation_distance` of 0.0 (guarded), which is mathematically correct but may surprise consumers.
