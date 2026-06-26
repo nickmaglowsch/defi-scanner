@@ -6,7 +6,11 @@ from types import TracebackType
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from web3 import Web3 as _RealWeb3
+
+from app.config import settings
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -73,3 +77,23 @@ def mock_provider(mocker) -> AsyncMock:  # type: ignore[no-untyped-def]
     provider = mocker.AsyncMock()
     provider.fetch_reserves.return_value = []
     return provider
+
+
+# ── Real DB session (for integration tests that need actual SQL) ──────────────
+
+
+@pytest_asyncio.fixture
+async def db_session() -> AsyncSession:  # type: ignore[misc]
+    """Yield a real async DB session; roll back after the test to avoid pollution.
+
+    Engine is created inside the fixture so it binds to the test's event loop.
+    """
+    # ponytail: engine created per-fixture to bind to current event loop (asyncpg
+    # requires this; module-level engine attaches to the import-time loop).
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as session:
+        await session.begin()
+        yield session
+        await session.rollback()
+    await engine.dispose()

@@ -53,7 +53,9 @@ def score_opportunities(opportunities: list[dict], weights: dict) -> list[dict]:
             w = weights.get(k, 1.0)
             total += w * normalized[i][k]
         opp["score"] = total
-        # ponytail: keep original input fields intact; score and rank are added
+        opp["breakdown"] = dict(normalized[i])
+        opp["weights"] = dict(weights)
+        # ponytail: keep original input fields intact; score, rank, breakdown, weights are added
 
     # ── Sort descending by score, assign ranks (ties share rank) ──────────────
     result = sorted(opportunities, key=lambda r: r["score"], reverse=True)

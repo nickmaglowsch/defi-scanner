@@ -1,105 +1,58 @@
 # Planning Questions
 
 ## Codebase Summary
-Greenfield repository (`feat/defi-alpha-scanner` branch, one init commit). No existing code, conventions, or infrastructure. The MVP vertical slice must establish the full architecture shape: Spring Boot backend + PostgreSQL + Flyway + Next.js frontend in a single monorepo. One lending adapter (Aave V3) and one funding adapter (Hyperliquid) as concrete implementations, with interface seams for future protocols.
+
+Verified the recon — it's accurate. Concrete findings that shape the plan:
+
+**Backend (FastAPI + SQLAlchemy async + Postgres + pytest)**
+- `app/calculations/ranker.py:score_opportunities()` computes the 7 component scores, min-max normalizes them, weighted-sums into `score`, sorts, ranks — then **discards the normalized components** (only `score` and `rank` survive on the dict, lines 50-67). Exposing the breakdown (PRD #5) means returning the per-component normalized values + weights, which requires plumbing them out of the ranker.
+- `app/api/routes.py` `/opportunities` is already the unified loop+carry endpoint with filters; loop & carry calcs are pure (`looping.py`, `carry.py`) and cached in `LoopCalculation`/`CarryCalculation` tables.
+- `Protocol` model has `id, name, type, chain, risk_score, created_at`. **No protocol-age, audit-history, or deep-link/URL fields exist.** `created_at` is row-insert time (when our seeder ran), not protocol launch date — useless as a real age proxy.
+- History data exists in `lending_snapshots` (deposit_apy, borrow_apy) and `funding_snapshots` (funding_rate, annualized_funding), indexed by market_id + observed_at. There is **no stored history of computed `effective_yield` / `net_carry` / `spread`** — those are derived per-request. So "Today / Yesterday / 7D / 30D of yield" (PRD #4) must be recomputed from raw APY history, OR approximated from the raw input fields' history.
+- No returns time-series exists anywhere (Sharpe has no natural input).
+- Tests: pytest + pytest-asyncio, `backend/tests/conftest.py` fixtures, files `test_api/looping/carry/ranker/alerts/*_adapter`.
+
+**Frontend (Next.js 16, React 19, Tailwind v4, shadcn)**
+- `frontend/AGENTS.md` warns: **this is a modified Next.js with breaking changes vs. training data — read `node_modules/next/dist/docs/` before writing frontend code.** (Note: `node_modules` isn't installed in this checkout yet, so that doc-read must happen at implementation time after `npm install`.)
+- Installed: recharts, @tanstack/react-table, lucide-react, @base-ui/react, shadcn ui primitives (Button/Card/Input/Select/Table). **No react-query** — components use `useState/useEffect + fetch` via `src/lib/api.ts`.
+- `page.tsx` = title + home-cards + loop-table + carry-table + funding-chart.
+- Minor drift to fix in passing: `api.ts:FundingSnapshotOut` is missing the `asset`/`protocol` fields the backend now returns.
 
 ---
 
 ## Questions
 
-### Q1: Monorepo layout — where do backend and frontend live?
-**Context:** The PRD specifies a single repo containing both the Java backend and Next.js frontend. The directory structure will determine build tooling, Docker Compose paths, and developer ergonomics for the lifetime of the project.
-**Options:**
-- A) **Flat root**: `backend/` and `frontend/` at repo root. No monorepo tooling (no Turborepo, Nx). Each has its own build config. Simplest.
-- B) **Packages-style**: `packages/backend/` and `packages/frontend/` with a root `package.json` (or `pnpm-workspace.yaml`) for shared scripts/linting. Adds tooling overhead but standardizes cross-package commands.
-- C) **Polyglot monorepo tool**: Turborepo or Nx at root orchestrating both Maven/Gradle + npm/pnpm builds. Heavy initial config, but unified `turbo build` / `turbo test`.
-**Recommendation:** A — Flat root. No orchestration tooling needed. Backend and frontend are built, tested, and deployed independently. A root `docker-compose.yml` ties them together for local dev. Add Turborepo/Nx only when the repo grows 3+ packages with shared deps.
+### Q1: Rating Engine math — confidence formula and label thresholds (with partly-synthetic inputs)
+**Context:** The killer Rating Engine needs a 0-100 score, a confidence %, and a label (Excellent / Very Good / etc.), layered over the existing 7 component scores. The user already accepted that protocol-age, audit-history, and persistence inputs are stubbed/heuristic for now. But the *shape* of the formulas is a real decision that the engine and all the UI labels depend on.
+**Question:** For the first build, confirm these defaults (I'll use them unless you say otherwise):
+- **Score 0-100** = the existing weighted ranker `score`, but min-max normalized across the batch ×100 (so the top opportunity is ~100). Acceptable, or do you want an absolute scale (e.g. fixed yield/risk bands) so a weak day doesn't show a "100"?
+- **Label thresholds** on that 0-100: Excellent ≥85, Very Good ≥70, Good ≥55, Fair ≥40, Avoid <40.
+- **Confidence %** = a function of *data completeness + sample depth*: starts at a base, penalized when an input is stubbed (age/audit/persistence) and when snapshot history is thin (< N points). So stubbed-heavy opportunities visibly read lower confidence. Good approach, or do you have a specific confidence definition in mind?
 
----
+### Q2: Sharpe sort with no returns series
+**Context:** PRD #6 lists "Sharpe" as a sort option, but there is no returns time-series in the DB — only raw APY/funding snapshot history. A true Sharpe ratio isn't computable.
+**Question:** Which do you want?
+- A) **Approximate Sharpe** = expected net yield ÷ APY volatility (we already compute a volatility penalty via STDDEV of recent funding rates / we can do the same for deposit_apy). Cheap, directionally meaningful, clearly labeled as an approximation.
+- B) **Drop "Sharpe"** from the sort list for now and ship Expected Return / Risk / Confidence / Liquidity; add Sharpe when a real returns series exists.
+- C) Something else.
+(I lean A — it reuses existing volatility infra and keeps the PRD's sort option.)
 
-### Q2: Java build tool — Maven or Gradle?
-**Context:** Spring Boot is equally well-supported by both. The choice affects the entire backend module structure, dependency management, and task scripting.
-**Options:**
-- A) **Maven** (`pom.xml`) — Spring Initializr default. Declarative XML, simpler for single-module or few-module projects. Wider ecosystem of Spring Boot starters documented in Maven XML.
-- B) **Gradle** (Groovy DSL) — More concise, faster incremental builds, better for multi-module builds with complex custom tasks.
-- C) **Gradle** (Kotlin DSL) — Same as B but with type-safe build scripts, steeper learning curve if team isn't Kotlin-fluent.
-**Recommendation:** A — Maven. The backend is a single-module (or at most 2-3 modules: core, adapters, api) Spring Boot app. Maven's convention-over-configuration matches the scope. No custom build logic anticipated that would justify Gradle's flexibility.
+### Q3: Capital Simulator — default value and persistence
+**Context:** PRD #7 wants a global capital input (e.g. $20,000) that converts every yield to $/yr and $/mo across all cards. This is global UI state with no backend involvement.
+**Question:** Confirm: default **$20,000**, persisted in **localStorage** (survives reload, no backend, no auth), shared via a React context provider at the app root. Is localStorage fine, or do you want it purely in-memory (resets each load)? And is $20,000 the right default?
 
----
+### Q4: Fate of the old tables / page — delete vs. keep behind a route
+**Context:** PRD #1/#6 replace the two static tables with a unified feed; PRD #10 wants a terminal-style "Today's Best Opportunities" board as the new landing. The existing `page.tsx`, `loop-table.tsx`, `carry-table.tsx`, `funding-chart.tsx` would be superseded.
+**Question:** When the new feed + terminal landing ship, should I **delete** `loop-table.tsx` / `carry-table.tsx` and rebuild `page.tsx`, or **keep the old tables behind a secondary route** (e.g. `/classic`) during transition? (Deleting is cleaner and these are easily recovered from git; I'll delete unless you want the fallback route.)
 
-### Q3: JavaScript package manager — npm, pnpm, or yarn?
-**Context:** The Next.js frontend needs a package manager. This affects lockfile format, install speed, and CI config.
-**Options:**
-- A) **npm** — Ships with Node.js. Zero install step. Sufficient for a single frontend package.
-- B) **pnpm** — Faster, disk-efficient, strict dependency resolution. Overkill for one package, but scales well if a monorepo workspace emerges later.
-- C) **yarn** — Comparable to pnpm. No clear advantage over npm for a single package.
-**Recommendation:** A — npm. Already on the machine with Node.js. One less global tool to document in CONTRIBUTING.md. No workspace features needed yet.
+### Q5: "Open in protocol" deep links when no URL exists
+**Context:** PRD #9 wants an "Open in Morpho →" link on the detail view, but there is no URL field on `Protocol` or `Market` anywhere in the schema.
+**Question:** How should deep links work for the first build?
+- A) **Static hardcoded map** of protocol name → base app URL (e.g. Aave → app.aave.com), shown only when a protocol is in the map; hidden otherwise. No schema change, no new collector. (Lazy default — fits the "defer new data collection" constraint.)
+- B) Add a nullable `url` column to `Protocol` and seed it manually.
+- C) Skip deep links entirely for now.
+(I lean A.)
 
----
-
-### Q4: Aave V3 data source — how to fetch lending rates?
-**Context:** Aave V3 data (deposit APY, borrow APY, utilization, TVL) can be read from multiple sources. Each has different reliability, rate-limiting, and data shape implications. This is the single most consequential integration design decision for the MVP.
-**Options:**
-- A) **The Graph subgraph** (GraphQL against Aave's official subgraph on The Graph Network or a hosted service). Structured, documented schema. No RPC needed. Free tier may rate-limit; paid API key available. Returns all needed fields in one query.
-- B) **On-chain via Web3j** (Ethereum RPC call to Aave V3 Pool contract methods). Maximum decentralization, no intermediary. Requires an RPC provider (Infura, Alchemy) with its own rate limits. Contract ABIs needed. Each metric is a separate contract call — N+1 query problem unless batched via multicall.
-- C) **Aave UI API** (unofficial REST endpoint used by app.aave.com). Reverse-engineered, no SLA, may break without notice. Not recommended for anything beyond prototyping.
-**Recommendation:** A — The Graph subgraph. Single query returns all metrics per reserve. No RPC dependency, no ABI maintenance, no multicall complexity. Well-documented, versioned schema. The free tier's rate limit is fine for a periodic collector (every few minutes, not per-second). If rate-limited, add a paid API key later. Design the `LendingProvider` interface to accept a configurable GraphQL endpoint URL so Morpho/Spark subgraphs slot in later.
-
----
-
-### Q5: TimescaleDB — use the actual extension or plain PostgreSQL?
-**Context:** The PRD calls out TimescaleDB hypertables for time-series snapshots. For local dev, this means using the `timescale/timescaledb` Docker image instead of `postgres`. The extension must be enabled per-database with `CREATE EXTENSION IF NOT EXISTS timescaledb;`. Flyway can handle this in a migration.
-**Options:**
-- A) **Use TimescaleDB** — Docker image `timescale/timescaledb:pg16`, enable extension in first Flyway migration, create hypertables for `lending_snapshots` and `funding_snapshots`. Automatic time-based partitioning, built-in compression, fast time-range queries.
-- B) **Plain PostgreSQL with timestamps** — Standard `postgres:16` image. Index the `observed_at` column with a BRIN or B-tree index. No hypertable. Simpler Docker setup, no extension dependency. Adequate for MVP data volumes (snapshots every few minutes for 2 markets = ~30k rows/month).
-**Recommendation:** A — TimescaleDB. The Docker image swap is trivial (`timescale/timescaledb:latest-pg16` instead of `postgres:16`). The `CREATE EXTENSION` migration is one line. Hypertables and automatic partitioning are genuinely useful for the time-range queries the dashboard charts will run. If the extension is unavailable in a specific environment, fallback to plain Postgres is straightforward — just skip `create_hypertable()`.
-
----
-
-### Q6: Collector resilience — what happens when Aave/Hyperliquid APIs fail or rate-limit?
-**Context:** External API calls will occasionally fail (network blip, rate limit, API downtime). The collector must not crash the application, and the system should degrade gracefully — ideally still serving the last known good data.
-**Options:**
-- A) **Retry + skip** — 3 retries with exponential backoff (1s, 2s, 4s). On exhaustion, log the error and skip this cycle. The API returns 200 with the most recent snapshot (which may be stale). No persistent cache; callers see data age and decide.
-- B) **Retry + stale cache** — Same retry strategy, but persist the last successful response. On failure, serve the cached value with a `stale: true` flag in the API response. Adds a cache layer (in-memory map or Redis if available).
-- C) **Circuit breaker** — Full resilience pattern (Resilience4j). After N consecutive failures, stop calling the external API for a cooldown period. Over-engineered for a read-only scanner where stale data is acceptable.
-**Recommendation:** A — Retry + skip. Three retries with backoff in the collector's HTTP call wrapper. On failure, the collector logs and moves on. The API serves the most recent snapshot by `MAX(observed_at)` — naturally stale if the latest collection failed. The dashboard can show "last updated: X minutes ago" so users know data freshness. No extra cache infrastructure. This is the laziest working solution; upgrade to B only if users complain about gaps.
-
----
-
-### Q7: API authentication — public or protected?
-**Context:** The MVP serves read-only market data and opportunity rankings. No user accounts, no wallets, no write operations. Whether to add any auth layer affects the Spring Security config, CORS setup, and frontend fetch logic.
-**Options:**
-- A) **No auth** — Public, open API. CORS configured to allow the Next.js origin. Zero auth infrastructure. Simplest possible setup.
-- B) **API key via header** — A single static API key (`X-API-Key` header) configured via environment variable. Frontend includes it in all requests. Trivial to implement with a Spring Security filter, stops casual scraping.
-- C) **JWT + user accounts** — Full auth with login, user management, token refresh. Massively over-scoped for an MVP with no user data.
-**Recommendation:** A — No auth. The system is read-only and serves public DeFi data. No PII, no write operations, no per-user state. CORS to allow the frontend origin. Add an API key later if the endpoint gets hammered by bots. Skip Spring Security entirely for the MVP — a simple CORS filter is enough.
-
----
-
-### Q8: HTTP client for the Java backend — which library?
-**Context:** Collectors need to make outbound HTTP calls to The Graph subgraph (GraphQL POST), Hyperliquid REST API (GET), and Telegram webhook (POST). Spring Boot offers several options, each with different ergonomics.
-**Options:**
-- A) **RestTemplate** — Synchronous, blocking. Spring's legacy HTTP client. Simple API, well-known. Being phased out in favor of WebClient, but still fully supported.
-- B) **WebClient** — Spring's reactive, non-blocking client. Modern API, supports sync and async usage. The recommended replacement for RestTemplate. Requires `spring-boot-starter-webflux` dependency (pulls in Netty).
-- C) **JDK `HttpClient` (Java 11+)** — Built into the JDK. No extra dependency. Supports HTTP/2, async. Less ergonomic than Spring options for JSON deserialization.
-- D) **OkHttp** — Popular third-party library. Clean API, connection pooling, retry interceptor support. Requires an extra dependency.
-**Recommendation:** B — WebClient. It's Spring's recommended HTTP client going forward, integrates natively with Spring Boot's autoconfiguration, supports easy JSON deserialization via Jackson, and can be used synchronously with `.block()` for collector use cases (no need for full reactive pipeline). The WebFlux starter dependency is lightweight.
-
----
-
-### Q9: Risk score volatility input — compute or skip for MVP?
-**Context:** The opportunity scoring formula includes `volatility_penalty` which requires historical price/rate volatility data — something we don't have until we've been collecting for a while. This input fundamentally differs from other inputs (yield, liquidity, TVL) which come from a single snapshot.
-**Options:**
-- A) **Skip volatility_penalty for MVP** — Remove it from the score formula. Compute the score from the remaining inputs (yield, liquidity, TVL, stability, utilization, protocol risk). Add volatility once enough historical data exists (e.g., after 30 days of snapshots).
-- B) **Compute from funding rate volatility** — Use the standard deviation of funding rate snapshots we've collected so far as a proxy. Requires at least ~20 snapshots before the metric is meaningful. Results in a zero penalty for the first hour of operation.
-- C) **Fetch external price data** — Integrate an oracle/price feed (e.g., Chainlink, CoinGecko API) to compute asset price volatility. Adds a new external dependency and data source for the MVP.
-**Recommendation:** B — Compute from our own funding rate snapshots. It's zero-cost (we already collect the data), requires no new external integrations, and becomes more accurate over time. During the initial bootstrap period (~20 snapshots), return a zero volatility_penalty (neutral). This is a single SQL `STDDEV(funding_rate) OVER (LAST 20 ROWS)` query. The formula weight stays in config, so if the proxy proves noisy, it can be disabled by setting the weight to 0.
-
----
-
-### Q10: TDD mode?
-**Context:** The scoping decision highlights that calculation logic (looping, carry, opportunity scoring) must be covered by unit tests. TDD mode means writing failing tests before implementation code for each task.
-**Options:**
-- A) **Yes — TDD mode** — Each functional task writes a failing test first, confirms it fails, then writes the implementation. Guarantees test coverage on all calculation logic.
-- B) **No — write tests after or alongside** — Implement first, then add tests. Faster initial velocity, lower cognitive overhead per task.
-**Recommendation:** A — TDD mode. The calculation engine is pure, deterministic math (no I/O, no side effects) — the ideal candidate for TDD. The adapter layer (HTTP calls to Aave/Hyperliquid) is less suited for strict TDD since it requires mocking, but the pure calculation layer (LoopingSimulator, CarryCalculator, OpportunityRanker) benefits enormously from test-first. This aligns with the scoping decision's emphasis on tested calculations.
+### Q6: TDD mode
+**Context:** Standing question for every build. The backend has a solid pytest suite (ranker/looping/carry/api all covered); the Rating Engine is pure-function-shaped and naturally testable. Frontend has no test setup today.
+**Question:** Do you want **TDD mode** for this build? If yes, the task implementer writes failing tests before implementation code for each task (I'll scope it to the backend pure functions + API where it pays off, since there's no frontend test harness yet — say if you want a frontend test harness stood up too).

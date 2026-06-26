@@ -205,3 +205,72 @@ def test_output_contains_required_keys():
     for k in ("yield_score", "liquidity_score", "tvl_score", "stability_score",
               "utilization_penalty", "volatility_penalty", "protocol_risk"):
         assert k in item, f"missing key: {k}"
+
+
+# ── 11. Breakdown present and normalized ──────────────────────────────────────
+
+_ALL_METRIC_KEYS = (
+    "yield_score", "liquidity_score", "tvl_score", "stability_score",
+    "utilization_penalty", "volatility_penalty", "protocol_risk",
+)
+
+
+def test_breakdown_present_all_keys_normalized():
+    """scored opp has breakdown with all 7 metric keys, each float in [0,1]."""
+    opps = [_opp(), _opp(yield_score=10.0)]
+    result = score_opportunities(opps, _DEFAULT_WEIGHTS)
+
+    for item in result:
+        assert "breakdown" in item, "breakdown key missing"
+        bd = item["breakdown"]
+        for k in _ALL_METRIC_KEYS:
+            assert k in bd, f"breakdown missing key: {k}"
+            assert isinstance(bd[k], float), f"breakdown[{k}] not float"
+            assert 0.0 <= bd[k] <= 1.0, f"breakdown[{k}]={bd[k]} out of [0,1]"
+
+
+# ── 12. Breakdown reflects penalty inversion ─────────────────────────────────
+
+
+def test_breakdown_penalty_inversion():
+    """Lower raw utilization_penalty → higher breakdown[utilization_penalty]."""
+    opps = [
+        _opp(utilization_penalty=0.1),
+        _opp(utilization_penalty=0.9),
+    ]
+    result = score_opportunities(opps, _DEFAULT_WEIGHTS)
+    low_pen = next(r for r in result if r["utilization_penalty"] == 0.1)
+    high_pen = next(r for r in result if r["utilization_penalty"] == 0.9)
+    assert low_pen["breakdown"]["utilization_penalty"] > high_pen["breakdown"]["utilization_penalty"]
+
+
+# ── 13. Weights echoed on each opportunity ────────────────────────────────────
+
+
+def test_weights_echoed():
+    """returned weights equals the weights passed in."""
+    custom = {**_DEFAULT_WEIGHTS, "yield_score": 3.0}
+    opps = [_opp(), _opp(yield_score=8.0)]
+    result = score_opportunities(opps, custom)
+
+    for item in result:
+        assert "weights" in item, "weights key missing"
+        assert item["weights"] == custom
+
+
+# ── 14. Existing behavior intact after breakdown addition ─────────────────────
+
+
+def test_existing_behavior_intact_with_breakdown():
+    """score, rank, and input keys still present and ordering unchanged."""
+    opps = [_opp(yield_score=1.0), _opp(yield_score=5.0), _opp(yield_score=3.0)]
+    result = score_opportunities(opps, _DEFAULT_WEIGHTS)
+
+    ranked = sorted(result, key=lambda r: r["rank"])
+    assert ranked[0]["yield_score"] == 5.0
+    assert ranked[0]["rank"] == 1
+    for item in result:
+        assert "score" in item
+        assert "rank" in item
+        assert "breakdown" in item
+        assert "weights" in item

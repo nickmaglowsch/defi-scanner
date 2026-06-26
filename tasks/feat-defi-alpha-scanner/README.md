@@ -1,72 +1,58 @@
-# DeFi Alpha Scanner — MVP Vertical Slice
+# DeFi Alpha Scanner — Decision Engine Build
 
-**Branch**: `feat/defi-alpha-scanner` | **Stack**: Python 3.12 / FastAPI + Next.js 15 | **Database**: PostgreSQL 16 + TimescaleDB
+Transforms the scanner from a DefiLlama-style data explorer into a Bloomberg/TradingView-style decision engine: a unified opportunity feed with risk-first cards, an Opportunity Rating Engine (0-100 + confidence + leaderboard), a global capital simulator, historical yield context, and a terminal-style "Today's Best" hero.
 
-## Summary
+See `updated-prd.md` for the codebase-grounded spec (including exact rating/confidence/Sharpe formulas) and `shared-context.md` for tech stack, test infra, and conventions shared across tasks.
 
-Read-only DeFi intelligence platform that scans lending protocols and perpetual exchanges for yield opportunities. This MVP vertical slice delivers the full architecture end-to-end: Aave V3 on-chain collector → Hyperliquid REST collector → Postgres/TimescaleDB → calculation engine (looping, carry, ranker) → REST API → Next.js dashboard with cards, tables, and a history chart. Architecture is provider-pluggable — adding a new protocol is a single interface implementation.
+## Tasks (11 total)
 
-## Task Overview
+**Backend (TDD — pytest):**
+- `task-01` Expose ranker component score breakdown
+- `task-02` Yield history aggregation (today/yesterday/7D/30D)
+- `task-03` Opportunity Rating Engine (rating/label/confidence/Sharpe, stubbed metadata)
+- `task-04` Wire breakdown + history + rating + sharpe into the API (+ `api.ts` types, FundingSnapshotOut fix)
 
-**9 tasks** | Estimated ~4-6 hours of implementation work (parallelizable waves reduce wall-clock time)
+**Frontend (no tests — modified Next.js 16, read bundled docs first):**
+- `task-05` Protocol deep-link static map
+- `task-06` Capital simulator context + provider + input
+- `task-07` Shared opportunity card (risk-first, ⭐/100, $ conversion, health, WHY breakdown, history)
+- `task-08` Terminal-style "Today's Best" hero
+- `task-09` Unified feed/screener + rebuilt landing page (deletes old tables)
+- `task-10` Opportunity detail view + historical charts + deep link
+- `task-11` Rating leaderboard 🥇🥈🥉
 
-| # | Task | Dependencies | TDD? | Category |
-|---|------|-------------|------|----------|
-| 01 | Repo Scaffold & Dev Environment | None | No | Scaffold |
-| 02 | DB Schema & Alembic Migrations | 01 | No | Schema |
-| 03 | Aave V3 Lending Adapter & Collector | 02 | No | Collector |
-| 04 | Hyperliquid Funding Adapter & Collector | 02, 03 | No | Collector |
-| 05 | Looping Simulator | 02 | **Yes** | Calculation |
-| 06 | Carry Calculator | 02, 05 | **Yes** | Calculation |
-| 07 | Opportunity Engine & REST API | 02, 05, 06 | Ranker only | Integration |
-| 08 | Alert Engine & Telegram Notification | 02, 07 | No | Feature |
-| 09 | Frontend Dashboard | 01, 07 | No | UI |
-
-## Dependency Graph
+## Dependency graph
 
 ```
-01 (scaffold)
- └── 02 (schema)
-      ├── 03 (aave) ──┐
-      │    └── 04 (hyperliquid) ──┐
-      ├── 05 (loop calc, TDD) ────┤
-      └── 06 (carry calc, TDD) ───┘
-           └── 07 (API + ranker)
-                ├── 08 (alerts)
-                └── 09 (frontend)
+01 ─┐
+02 ─┼─► 04 ─┬─────────────────────────► 06? (no) 
+03 ─┘       │
+01 ─► 03    │  (04 blocks all frontend data consumers)
+            ├─► 07 ─┬─► 08 ─┐
+06 ─────────┤       ├─► 11 ─┤
+05 ─────────┼─► 10 ─┤       │
+            │       └───────┴─► 09 (landing page, composes everything)
+            └─► 09
 ```
 
-**Parallel waves**:
-- Wave 1: 01
-- Wave 2: 02
-- Wave 3a: 03, 05, 06 (parallel after 02)
-- Wave 3b: 04 (after 03 — shares main.py collector wiring)
-- Wave 4: 07
-- Wave 5: 08, 09 (parallel after 07)
+Concretely:
+- **01, 02** have no deps → can start immediately, in parallel.
+- **03** depends on 01.
+- **04** depends on 01, 02, 03 (the backend integration point; blocks all frontend data consumers).
+- **05, 06** have no deps → can start immediately (frontend, parallel with backend).
+- **07** depends on 04 + 06.
+- **08** depends on 04 + 07.
+- **10** depends on 04 + 05 + 07.
+- **11** depends on 04 + 06 + 07.
+- **09** depends on 04 + 06 + 07 + 08 + 10 + 11 (final composition; deletes old tables).
 
-## How to Use
+Suggested waves: (01,02,05,06) → (03) → (04) → (07) → (08,10,11) → (09).
 
-These task files are prompts for AI agents. Each is self-contained with all context, target files, steps, and acceptance criteria needed to complete it independently.
+## Stubbed / deferred data (accepted by the user)
+Protocol age, audit history, and opportunity persistence are NOT collected. Tasks 03/04 use a static stubbed protocols-metadata map; rating **confidence** is partly synthetic and intentionally reads lower for stubbed-heavy / thin-history opportunities. No new collectors are built. See `updated-prd.md` → "Constraints accepted by the user".
 
-1. Execute tasks in dependency order (or use the parallel waves above)
-2. Delete each task file after completion
-3. When all files are deleted, the MVP vertical slice is complete
+## How to use these files
+These task files are prompts for AI agents. Each is self-contained (plus `shared-context.md`). Implement in dependency order. **Delete each file after its task is completed.** When all task files are deleted, the feature is complete.
 
-## Key Files (shared context)
-
-| File | Purpose |
-|------|---------|
-| `shared-context.md` | Tech stack, test infra, conventions — referenced by all tasks |
-| `updated-prd.md` | Full refined specification with architecture, schema, API, decisions log |
-| `planning-questions.md` | Original discovery questions + user answers (historical record) |
-
-## Decisions Recap
-
-- **Python pivot**: FastAPI replaces Spring Boot. uv for deps, ruff for lint.
-- **Aave data**: On-chain via web3.py (not The Graph). RAY conversion, embedded minimal ABI.
-- **TimescaleDB**: Real extension via Docker image + Alembic migration.
-- **Resilience**: Retry + skip. 3 attempts, exponential backoff.
-- **Auth**: None. Public read-only API.
-- **TDD**: Strict test-first for calculation logic (tasks 05, 06, ranker in 07).
-- **Raw payload**: JSONB column on snapshots, not separate tables.
-- **Ponytail**: Single API routes file, asyncio scheduler (no APScheduler), npm over pnpm, minimal modules.
+## Open questions / human input
+None blocking — all planning questions were answered. Non-blocking notes are in `updated-prd.md` → "Open Questions" (relative rating scale always allows "Excellent"; Sharpe is null when volatility is unavailable).

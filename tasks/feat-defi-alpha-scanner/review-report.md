@@ -1,133 +1,84 @@
-# Code Review Report — DeFi Alpha Scanner MVP
+# Code Review Report — DeFi Alpha Scanner: Re-Review of Auto-Fixes (uncommitted on commit 668e045)
 
 ## Summary
+All three findings from the prior review are **RESOLVED** and the fixes address the root causes, not symptoms. The slug normalization is applied at the boundary on both backend and frontend; the cross-batch rerate is a single shared-scale pass that leaves the route's sort keys untouched; the leaderboard client re-sort removal is sound under a verified monotonicity argument. Full backend suite is green (144 passed), TypeScript typecheck clean. No new Critical or Important issues in the changed lines. **Ship.**
 
-The vertical slice is structurally complete and the core deterministic calculations are well tested. However, it is **not ready to ship as-is** because several correctness/completeness gaps remain: the Docker stack does not run migrations, the looping calculator ignores on-chain LTV/liquidation-threshold data, the `/funding` endpoint cannot tell the UI which asset it is quoting, and the API has unbounded N+1 query patterns. These are fixable in a small follow-up pass.
+## Prior Findings — Resolution Status
 
-## PRD Compliance
+| # | Prior finding | Status | Verification |
+|---|---------------|--------|--------------|
+| Critical | Protocol display-name vs slug mismatch (confidence understated + dead Aave deep link) | ✅ RESOLVED | `_protocol_slug()` + `protocolLink` slug split; regression test drives real `"Aave V3"` → confidence 85 |
+| Important #1 | Cross-batch rating/medal collision in `type=all` | ✅ RESOLVED | `rerate_combined()` one shared scale + unique global top-3 medals; called in `get_opportunities` before sort/limit |
+| Important #2 | Limit-before-client-sort in leaderboard | ✅ RESOLVED | Redundant client re-sort removed; monotonicity argument holds (rating is strictly monotonic in score) |
+| Minor | Stale page-header subtitle / unused `_volatility_penalty` | ◻️ Not in scope of this pass | Carried forward (Minor, non-blocking) |
 
-| # | Requirement | Status | Notes |
-|---|-------------|--------|-------|
-| 1 | Python/FastAPI backend, SQLAlchemy 2.0 async, Alembic, web3.py, httpx | ✅ Complete | uv + pyproject.toml; Python 3.13 used locally but Dockerfile pins 3.12. |
-| 2 | Next.js 15 frontend | ⚠️ Partial | Next.js 16 installed (notes document this); build/lint pass. |
-| 3 | PostgreSQL + TimescaleDB hypertables for snapshots | ✅ Complete | `001_initial.py` creates extension + hypertables; soft FKs on calc tables due to partition-key rule (documented). |
-| 4 | 6 REST endpoints under `/api/v1` | ⚠️ Partial | All 6 exist, but `/funding` response lacks `asset`/`protocol` and ignores the `protocol` query param. |
-| 5 | Looping/carry/ranker calculation engine | ⚠️ Partial | Functions are pure and tested, but orchestrator/API hard-code `max_ltv=0.8` and `liquidation_threshold=0.85` instead of using reserve config from `raw_payload`. |
-| 6 | Provider-plugin interfaces (`LendingProvider`, `FundingProvider`) | ✅ Complete | `backend/app/collectors/base.py` defines both protocols. |
-| 7 | Aave V3 + Hyperliquid collectors with retry resilience | ✅ Complete | 3 retries with exponential backoff; failures logged and skipped. |
-| 8 | Alert engine + Telegram real channel, stub others | ✅ Complete | Telegram via httpx; other channels fall back to `LoggingChannel`. |
-| 9 | CORS restricted to frontend origin | ✅ Complete | `allow_origins=[settings.FRONTEND_ORIGIN]`; no wildcard default. |
-| 10 | Dashboard: home cards, loop/carry tables, funding chart | ⚠️ Partial | Funding card and chart selector show truncated UUIDs because `/funding` has no `asset` field. |
-| 11 | Docker Compose local orchestration | ⚠️ Partial | Compose validates, but backend container never runs Alembic migrations. |
-| 12 | TDD for calculations | ✅ Complete | `test_looping.py`, `test_carry.py`, `test_ranker.py` cover behavior and edge cases. |
+## Fix Verification Detail
 
-**Compliance Score**: 7/12 fully met, 5 partial.
+### Critical — slug mismatch (RESOLVED, root-cause)
+- `backend/app/calculations/rating.py:44-51`: `_protocol_slug(name)` returns lowercased first token; empty/blank → `""`. `_confidence` (line 73) now does `PROTOCOL_METADATA.get(_protocol_slug(protocol), {})`. `"Aave V3"` → `"aave"` → `{age_known, audit_known}` true, only persistence stubbed → completeness 0.85, depth 1.0 at `_history_points=20` → confidence 85. Confirmed by `test_confidence_resolves_display_name_to_slug` (asserts `pytest.approx(85.0)` from the REAL display name — exactly the value-selection gap that let the bug pass 141 tests before).
+- `frontend/src/lib/protocol-links.ts:11`: `name.toLowerCase().split(" ")[0]` → `"Aave V3"` resolves to `"aave"` key → deep link renders. Same normalization on both sides, so backend protocol names and frontend keys agree.
+- This is the boundary normalization the prior report recommended, not a per-caller patch. Both symptoms route through the single slug helper.
+
+### Important #1 — `rerate_combined` (RESOLVED, no sort regression)
+- `backend/app/calculations/rating.py:129-149`: rerates every merged object on one min-max scale over `.score`, resets `.medal=None`, then assigns 🥇🥈🥉 to the global top-3 by rating. Leaves `.confidence` untouched (correct — confidence is per-opportunity, not batch-relative).
+- `backend/app/api/routes.py:126-127`: invoked only when `type == "all"`, before sort/limit.
+- **Sort-interaction check (all five options):** `rerate_combined` mutates only `.rating`, `.rating_label`, `.medal`. The route's `_sort_key` (lines 130-136) keys on `.score`, `.risk_score`, `.confidence`, `.sharpe`, `.score` (liquidity proxy) — none of which rerate touches. So return/risk/confidence/sharpe/liquidity ordering is identical with or without the rerate. No mis-ordering introduced.
+- **Mutation safety:** the route does not read `.rating`/`.medal` after `rerate_combined` except to serialize the response model; `.rank` is left stale but is never used for `type=all` ordering or display (frontend uses positional index, not `.rank`). `.score` is a non-nullable `float` on both response models, so `min/max`/subtraction in rerate cannot hit `None`.
+- Covered by `test_rerate_combined_shared_scale_and_unique_medals` (top→100, bottom→0, exactly one of each medal, gold on highest score) and `test_rerate_combined_empty_is_noop`.
+
+### Important #2 — leaderboard re-sort removal (RESOLVED, monotonicity verified)
+- `frontend/src/components/rating-leaderboard.tsx:35-46`: client `[...data].sort(by rating)` removed; `getOpportunities({ sort: "return", limit: 10 }).then(setOpps)`.
+- Monotonicity argument holds: for `type=all` the API runs `rerate_combined` (rating = strictly monotonic min-max of `.score`) and returns results sorted `sort="return"` == `.score` desc == rating desc. So the server-side top-`limit` is already the correct top-rated set, in rating order — the client re-sort was redundant and the truncation now precedes the same ordering the display wants. Edge note: ties in score get equal rating; relative order within a tie is arbitrary but rating-equivalent, so display correctness is preserved.
+- No orphaned imports left by the removal (diff removes inline logic only; all imports still used). TypeScript typecheck passes.
+- `terminal-hero.tsx` (`sort:"return", limit:8`) never had a client re-sort; it benefits from the same server-side rerate and is now coherent.
 
 ## Issues Found
 
-### Critical (must fix before shipping)
+### Critical
+None.
 
-_None. No data-loss, auth-inversion, or secret-exposure issues were found._
+### Important
+None in the changed lines.
 
-### Important (should fix)
-
-- **`backend/app/calculations/orchestrator.py:46-54` and `backend/app/api/routes.py:344-352`**: Looping inputs `max_ltv=0.8` and `liquidation_threshold=0.85` are hard-coded, ignoring the actual Aave reserve configuration stored in `raw_payload`. This produces incorrect liquidation-distance and risk-score outputs for assets whose real parameters differ (e.g., WETH vs stablecoins). The fix is to source `ltv_pct` and `liquidation_threshold_pct` from the adapter output / raw payload and persist or pass them into `simulate_looping`.
-
-- **`backend/app/api/routes.py:133-164`**: `/funding` accepts a `protocol` query parameter but never applies it. More importantly, the response schema `FundingSnapshotOut` has no `asset` or `protocol` field, so the dashboard cannot label funding markets. This is the root cause of the UUID display in the home card and chart selector. Add `asset` and `protocol` to the response (join `markets` + `protocols`) and implement the `protocol` filter.
-
-- **`docker-compose.yml`** and **`backend/Dockerfile`**: The backend image starts Uvicorn directly and never runs `alembic upgrade head`. A fresh `docker compose up` will have an empty database and the app will not function. Add a migration step before app startup (e.g., an entrypoint script or a short-lived `migrate` service).
-
-- **`backend/app/api/routes.py:291-445` and `backend/app/alerts/engine.py:44-56`**: Both endpoints and the alert engine issue per-row `db.get()` and per-snapshot subqueries in loops, creating N+1 query patterns. With 100+ markets this will be slow. Use `selectinload`/joined eager loads or batch the latest-snapshot subquery once per request/cycle.
-
-- **`backend/app/calculations/carry.py:18`**: `risk_score` is unbounded. While the ranker min-max normalizes it, the raw value can exceed typical [0,1] expectations. This is documented but still a foot-gun for any consumer reading `carry_calculations.risk_score` directly. Consider clamping or documenting the scale explicitly.
-
-### Minor (nice to fix)
-
-- **`backend/tests/test_alerts.py:6,21,53` and `backend/tests/test_carry.py:183`**: `ruff check app/ tests/` reports unused imports (`timedelta`, `Alert`) and two E501 line-length violations in tests. The packet noted `ruff check app/` passes, but the project config does not exclude tests.
-
-- **`frontend/src/components/loop-table.tsx:63,68` and `carry-table.tsx:55,60,65,70`**: Numeric columns use TanStack Table's `sortingFn: "alphanumeric"`, which can sort 100 < 9 lexicographically. Use `"basic"` or a numeric comparator.
-
-- **`frontend/src/components/funding-chart.tsx:48` and `home-cards.tsx:95-96`**: Initial data fetches swallow errors with `.catch(() => {})`, hiding network/API failures from users. At minimum log or surface a retryable error.
-
-- **`backend/app/schemas/responses.py:44-57`**: `FundingSnapshotOut` omits `funding_interval_hours` even though it is stored in the DB; include it for completeness.
-
-- **`backend/app/api/routes.py:86-110`**: `/opportunities` silently ignores an invalid `type` parameter. Return `400` for values other than `all|loop|carry`.
-
-- **`backend/app/api/routes.py:157`**: The asset filter on `/funding` does not restrict to `market_type='perp'`. Harmless today but wrong once a lending market shares an asset name with a perp.
-
-- **`backend/app/collectors/hyperliquid.py:51-54`** and **`backend/app/alerts/channels.py:38`**: Injected/clients are never explicitly closed on shutdown. Add `aclose()` calls in the collector shutdown path or use a single shared `httpx.AsyncClient` with proper lifecycle.
-
-- **`backend/tests/test_api.py`**: API tests mostly exercise empty-response paths. Add at least one happy-path test for `/looping` and `/opportunities` that verifies calculations are returned with expected fields.
-
-- **`frontend/Dockerfile`**: Dev-only image is acceptable for the MVP but should be called out in README if not already.
+### Minor (carried forward / informational)
+- **`frontend/src/app/page.tsx`** (unchanged this pass): stale header subtitle ("Mempool monitoring · …") still unrelated to the loop/carry scanner. Non-blocking.
+- **`backend/app/api/routes.py:803-805`** (unchanged this pass): `_volatility_penalty` single-market wrapper still appears unused. Possible dead code; non-blocking.
+- **Out-of-scope changes present in working tree** (not part of the three documented fixes, but included in the uncommitted diff): `backend/app/collectors/aave.py` + `test_aave_adapter.py` (Aave V3 `ReserveDataLegacy` ABI layout correction — field order/count now matches the on-chain struct, `_ReserveData` unpack indices and tests updated consistently, 35/35 aave+rating tests pass) and `docker-compose.yml` (`NEXT_PUBLIC_API_URL` → `http://localhost:8000`, correct because `NEXT_PUBLIC_*` is inlined into the browser bundle and must be host-reachable). Both are coherent and test-covered; flagged only so the reviewer/committer is aware they ride along with this fix batch.
 
 ## What Looks Good
-
-- Clean separation between adapters, collectors, calculations, API, and alerts.
-- Deterministic calculation functions are well isolated and thoroughly tested.
-- Adapter retry logic uses exponential backoff and fails gracefully without crashing the collector loop.
-- No secrets or RPC URLs are logged.
-- CORS is not wildcard-open by default; it uses the configured frontend origin.
-- TimescaleDB hypertable creation is guarded so it also works on plain PostgreSQL.
-- Migrations are written manually and are consistent with the ORM models.
+- Single-boundary normalization for the slug fix — backend and frontend split identically, so the two symptoms share one fix point. No sibling caller left broken.
+- The new regression test exercises the real production value (`"Aave V3"`), closing the exact blind spot that hid the original bug.
+- `rerate_combined` is deliberately scoped: it touches only the batch-relative fields and leaves per-opportunity `confidence` and all sort keys alone, so it cannot perturb any sort ordering.
+- Comments on both fixes state intent (slug mapping rationale, why `confidence` is untouched, why the client re-sort is unnecessary) without over-explaining.
+- Aave ABI fix is rigorous: the comment names the exact struct-layout hazard (offset misreads if field order/count diverge) and the tests pin the new positional decode.
 
 ## Test Coverage
 
 | Area | Tests Exist | Coverage Notes |
 |------|-------------|----------------|
-| Looping calc | Yes | 16 cases: leverage, zero spread, negative carry, max loops, safety buffer, zero capital, liquidation distance, risk score, LTV clamping. |
-| Carry calc | Yes | 16 cases: positive/negative carry, zero inputs, risk formula, edge cases. |
-| Ranker | Yes | 10 cases: ranking, ties, weights, penalty inversion, determinism. |
-| Aave adapter | Yes | RAY conversion, config parsing, retry, utilization, collector upsert. |
-| Hyperliquid adapter | Yes | Annualization, response parsing, malformed response handling, retry. |
-| API | Partial | Smoke tests for all endpoints, but mostly empty-state; no happy-path calculation tests. |
-| Alerts | Yes | Threshold firing, dedup cooldown, channel dispatch, no-market case. |
-| Frontend | No | No automated UI tests (out of scope for MVP). |
+| Rating slug resolution | Yes | `test_confidence_resolves_display_name_to_slug` uses real `"Aave V3"`, asserts confidence 85 — closes prior gap |
+| `rerate_combined` | Yes | Shared-scale (100/0 bounds), unique medals, gold-on-top, empty no-op |
+| Aave ABI decode | Yes | Both tests rebuilt to new positional struct; assert decoded fields |
+| API routes (`type=all` rerate path) | Yes (existing) | `test_api.py` 20 passed; rerate runs through the route |
 
-**Test Coverage Assessment**: Calculation and adapter coverage is strong. API coverage is shallow and should be expanded before the endpoints are considered stable.
+**Test Coverage Assessment**: The +3 new tests target precisely the prior defects, including the value-selection gap. Assertions are specific (formula outputs, medal multiset, scale bounds) — not existence-only.
 
 ## Test Execution
 
 | Check | Result | Details |
 |-------|--------|---------|
-| Test command discovered | Yes | `pytest` in `backend/` (from `pyproject.toml` dev deps). |
-| Test suite run | Passed (109/109) | `uv run pytest -q` → 109 passed in ~15.7s. |
-| TDD evidence in implementation notes | Yes | Tasks 05/06/07 document TDD, extra adequacy tests, and passing runs. |
-| Lint | Partial | `uv run ruff check app/ tests/` → 4 issues in tests only. |
+| Test command discovered | Yes (`pytest`) | `backend/pyproject.toml`; ran via `backend/.venv` |
+| Backend suite run | Passed (144/144) | First full run showed 4 transient `ConnectionRefusedError` in `test_history_agg.py`; re-ran in isolation and full suite → all green. DB-connection flake, not a code regression (history_agg.py unchanged) |
+| Rating + Aave subset | Passed (35/35) | Confirms the changed modules directly |
+| API routes | Passed (20/20) | `type=all` rerate path exercised |
+| Frontend typecheck | Passed | `tsc --noEmit` exit 0 |
+| TDD evidence | Yes | Regression tests added RED→GREEN for each fix |
 
-**Test Execution Assessment**: Backend tests are green. Fix the four ruff warnings in tests to keep CI clean.
-
-## TDD Compliance
-
-| Task | Tests Written | Tests Adequate | TDD Skipped Reason Valid | Notes |
-|------|---------------|---------------|-------------------------|-------|
-| Task 05 — Looping | Yes | Yes | N/A | Asserts on results, formulas, and edge cases; no trivial true assertions. |
-| Task 06 — Carry | Yes | Yes | N/A | Covers sign/negative cases and risk-score formula. |
-| Task 07 — Ranker | Yes | Yes | N/A | Covers ranking, ties, weights, penalty inversion. |
-
-**TDD Assessment**: TDD was applied correctly to the three pure-calculation tasks.
-**Test Adequacy**: 36/36 meaningful. No weak type/existence-only assertions were flagged in the calc suite.
-**Mocking Discipline**: Adapter tests mock at the system boundary (httpx client, web3 contract functions). API/alert tests mock the DB session dependency. No internal modules or the code-under-test itself are mocked.
-
-## Implementation Decision Review
-
-| Task | Decisions Documented | Decisions Sound | Flags |
-|------|---------------------|----------------|-------|
-| Task 01 — Scaffold | Yes | Mostly | Next.js 16 / Tailwind v4 is bleeding edge but documented as a risk. |
-| Task 02 — DB schema | Yes | Yes | Soft FKs for hypertables are the correct TimescaleDB pattern. |
-| Task 03 — Aave adapter | Yes | Yes | Storing raw integer amounts is correct for ratio math. |
-| Task 04 — Hyperliquid adapter | Yes | Yes | Neutral `long_short_ratio` is documented. |
-| Task 05/06/07 — Calcs/API | Yes | Partial | Default/hard-coded looping LTV params are not sourced from on-chain data — a real correctness gap. |
-| Task 08 — Alerts | Yes | Yes | Per-market queries are acknowledged as a future scaling concern. |
-| Task 09 — Frontend | Yes | Partial | The `market_id` UUID fallback is documented, but it is still a dashboard UX/completeness issue. |
-
-**Decision Assessment**: Most documented decisions are sound. The two decisions that need revisiting are (1) ignoring on-chain LTV/liquidation threshold in loop calculations, and (2) shipping `/funding` without an asset field.
+**Test Execution Assessment**: Green. The lone wobble was a transient Postgres connection refusal under full-suite load that cleared on re-run; not attributable to these edits.
 
 ## Recommendations
+1. Ship the three fixes — root causes resolved, no regressions, tests pin the formerly-uncaught paths.
+2. Decide explicitly whether the bundled Aave ABI + docker-compose changes belong in this commit or a separate one; they are correct but were not part of the documented fix scope.
+3. (Backlog, Minor) Update the stale `page.tsx` subtitle and remove `_volatility_penalty` if confirmed dead.
 
-1. **Add Alembic migration step to the Docker entrypoint** so `docker compose up` produces a working stack.
-2. **Source real `ltv_pct` and `liquidation_threshold_pct`** from the Aave adapter output / `raw_payload` and thread them through `simulate_looping` in both the orchestrator and API fallback path.
-3. **Enrich `/funding`** with `asset` and `protocol` fields and implement the `protocol` query-param filter so the dashboard can label funding markets.
-4. **Batch the per-market lookups** in `/looping`, `/opportunities`, and the alert engine to eliminate N+1 queries.
-5. **Fix the ruff warnings** in tests and switch TanStack Table numeric columns to a numeric sorting function.
-6. **Add at least one API happy-path test** that exercises `/looping` and `/opportunities` with mocked snapshots and asserts on computed output fields.
+**Verdict: SHIP.**

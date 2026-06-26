@@ -59,6 +59,13 @@ class FundingSnapshotOut(BaseModel):
     index_price: float | None = None
 
 
+class YieldHistoryOut(BaseModel):
+    today: float | None = None
+    yesterday: float | None = None
+    avg_7d: float | None = None
+    avg_30d: float | None = None
+
+
 class LoopOpportunityOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -73,6 +80,16 @@ class LoopOpportunityOut(BaseModel):
     risk_score: float | None = None
     score: float
     rank: int
+    # Task-04 enrichment fields
+    market_id: str | None = None
+    breakdown: dict[str, float] | None = None
+    weights: dict[str, float] | None = None
+    rating: float | None = None
+    rating_label: str | None = None
+    confidence: float | None = None
+    medal: str | None = None
+    sharpe: float | None = None
+    history: YieldHistoryOut | None = None
 
 
 class CarryOpportunityOut(BaseModel):
@@ -88,6 +105,16 @@ class CarryOpportunityOut(BaseModel):
     risk_score: float | None = None
     score: float
     rank: int
+    # Task-04 enrichment fields
+    market_id: str | None = None
+    breakdown: dict[str, float] | None = None
+    weights: dict[str, float] | None = None
+    rating: float | None = None
+    rating_label: str | None = None
+    confidence: float | None = None
+    medal: str | None = None
+    sharpe: float | None = None
+    history: YieldHistoryOut | None = None
 
 
 class HistoryPointOut(BaseModel):

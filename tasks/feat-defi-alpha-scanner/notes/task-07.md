@@ -1,16 +1,8 @@
-# Task 07: Opportunity Engine & REST API
+# Task 07: Shared Opportunity Card Component
 
-- **Decisions**:
-  - Ranker normalizes all 7 metrics via min-max scaling across the batch. Penalty metrics (utilization, volatility, protocol_risk) are inverted as `1 - normalized` so higher raw penalty → lower contribution to score. When min==max, normalized value is 0 (neutral).
-  - Orchestrator (`trigger_loop_calculation`, `trigger_carry_calculation`) is called AFTER the collector commits the snapshot transaction, in a fresh session. This avoids interfering with pre-existing test mock expectations and keeps calculation failures from rolling back snapshot writes.
-  - Volatility penalty computed via SQL `STDDEV(funding_rate)` over the last N rows (default 20) — neutral 0 if insufficent rows.
-  - API routes use `func.max()` + `.label()` for subquery column access instead of `text()`, which avoids SQLAlchemy `AttributeError` on `.c.max_ts`.
-  - The `/opportunities` endpoint merges loop and carry results, scored separately by the ranker (each type gets its own normalization), then the combined list is sorted by score for a unified ranking.
-
-- **Deviations**:
-  - `Ranker.looping` and `Ranker.carry` in the responses schema renamed to `LoopOpportunityOut` / `CarryOpportunityOut` for consistency with the project's naming pattern.
-  - The `_trigger_calc` methods in collectors use try/except so a calc failure doesn't block the collector cycle (logged as error).
-
-- **Risks**:
-  - The `/looping` and `/opportunities` endpoints run `simulate_looping`/`calculate_carry` on every request for snapshots that haven't been calculated yet (due to lazy DB addition — not from collector cycles). Under high load this could create overhead; the idempotency check prevents duplicates but not recomputation. For production: use the orchestrator call from collectors as the primary write path.
-  - Volatility STDDEV query uses a simple LIMIT + STDDEV approach rather than the window function spec'd (`STDDEV OVER ROWS 20 PRECEDING`). This works correctly for the latest N rows per market but doesn't give per-row historical volatility. Sufficient for the penalty input to the ranker.
+- **Decisions**: `getRiskLabel`/`getRiskColor` are named exports (not just internal helpers) so tasks 08 and 11 can import without duplicating the thresholds. The risk dot (🟢/🟡/🔴) is a separate internal helper since callers only need the CSS color class or the label string, not the emoji.
+- **Decisions**: Stars rendered as a plain string (`⭐⭐⭐⭐☆`) rather than SVG icons — keeps it a one-liner, no extra icon imports, and the task spec used star emoji notation explicitly.
+- **Decisions**: `CarryOpportunityOut` doesn't expose `liquidity` or `tvl` fields in the current schema, so those headline items are omitted for carry cards (loop type also lacks explicit liquidity/TVL fields on the interface — the task mentions them but they don't exist in `api.ts`). No fabricated fields added.
+- **Deviations**: The `CardFooter` import was pulled in but unused — removed. Only `Card`, `CardHeader`, `CardTitle`, `CardDescription`, `CardContent` are used, matching actual card structure.
+- **Trade-offs**: Considered splitting history/breakdown into sub-components, but the whole card is one file by spec and the sections are small enough that extraction would be premature.
+- **Risks**: `opp.history!` non-null assertion used inside a block already guarded by `opp.history &&` — safe, but worth a reviewer glance.

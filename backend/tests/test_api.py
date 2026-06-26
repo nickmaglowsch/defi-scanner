@@ -316,8 +316,15 @@ def test_get_looping_returns_opportunities(client, mock_db):
     vol_result.all.return_value = []
     calc_result = MagicMock()
     calc_result.scalars.return_value.all.return_value = [calc]
+    # Task-04: two additional execute calls — get_yield_history + _volatility_map_lending
+    history_result = MagicMock()
+    history_result.all.return_value = []
+    deposit_vol_result = MagicMock()
+    deposit_vol_result.all.return_value = []
 
-    mock_db.execute = AsyncMock(side_effect=[snap_result, mp_result, vol_result, calc_result])
+    mock_db.execute = AsyncMock(
+        side_effect=[snap_result, mp_result, vol_result, calc_result, history_result, deposit_vol_result]
+    )
 
     resp = client.get("/api/v1/looping")
     assert resp.status_code == 200
@@ -347,3 +354,151 @@ def test_get_opportunities_with_limit(client, mock_db):
     assert resp.status_code == 200
     data = resp.json()
     assert len(data) <= 5
+
+
+# ── Task-04: new fields, sort, sharpe, history ────────────────────────────────
+
+
+def _loop_opportunity_mocks(snap=None, market=None, protocol=None, calc=None):
+    """Return mock execute side-effects for one full _fetch_loop_opportunities call.
+
+    After task-04 the call order is:
+      1. snapshots (scalars)
+      2. mp_rows (all)
+      3. vol_map funding (all)       — existing volatility_penalty
+      4. calc_result (scalars)
+      5. history_result (all)        — get_yield_history
+      6. deposit_vol_result (all)    — _volatility_map_lending
+    """
+    snap = snap or SimpleNamespace(
+        id=MOCK_SNAPSHOT_ID,
+        market_id=MOCK_MARKET_ID,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        deposit_apy=5.0,
+        borrow_apy=3.0,
+        utilization=0.7,
+        available_liquidity=1_000_000.0,
+        total_supplied=5_000_000.0,
+        total_borrowed=3_500_000.0,
+        tvl=10_000_000.0,
+        raw_payload=None,
+    )
+    market = market or SimpleNamespace(
+        id=MOCK_MARKET_ID, protocol_id=MOCK_PROTOCOL_ID, asset="USDC", market_type="lending"
+    )
+    protocol = protocol or SimpleNamespace(
+        id=MOCK_PROTOCOL_ID, name="Aave V3", type="lending", chain="ethereum", risk_score=0.5
+    )
+    calc = calc or _loop_calc_row()
+
+    snap_result = MagicMock()
+    snap_result.scalars.return_value.all.return_value = [snap]
+
+    mp_result = MagicMock()
+    mp_result.all.return_value = [(market, protocol)]
+
+    vol_result = MagicMock()
+    vol_result.all.return_value = []
+
+    calc_result = MagicMock()
+    calc_result.scalars.return_value.all.return_value = [calc]
+
+    # get_yield_history returns one row: (market_id, today, yesterday, avg_7d, avg_30d)
+    history_result = MagicMock()
+    history_result.all.return_value = [
+        (MOCK_MARKET_ID, 5.0, 4.8, 4.9, 4.7)
+    ]
+
+    # _volatility_map_lending: (market_id, stddev)
+    deposit_vol_result = MagicMock()
+    deposit_vol_result.all.return_value = [(MOCK_MARKET_ID, 0.5)]
+
+    return [snap_result, mp_result, vol_result, calc_result, history_result, deposit_vol_result]
+
+
+def test_opportunities_response_includes_new_fields(client, mock_db):
+    """GET /api/v1/opportunities items contain rating, breakdown, sharpe, history keys."""
+    mock_db.execute = AsyncMock(side_effect=_loop_opportunity_mocks())
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    opp = data[0]
+
+    # Task-04 required fields
+    for key in ("rating", "rating_label", "confidence", "breakdown", "weights", "sharpe", "history"):
+        assert key in opp, f"missing key: {key}"
+
+    assert isinstance(opp["breakdown"], dict)
+    assert isinstance(opp["weights"], dict)
+    assert isinstance(opp["history"], dict)
+
+
+def test_opportunities_rating_label_consistency(client, mock_db):
+    """Top-ranked item's rating >= others; label matches rating thresholds."""
+    mock_db.execute = AsyncMock(side_effect=_loop_opportunity_mocks())
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) >= 1
+    opp = data[0]
+
+    rating = opp["rating"]
+    label = opp["rating_label"]
+
+    # Single-item list → rating == 100 (min-max with one element)
+    assert rating == pytest.approx(100.0)
+
+    # Label must match threshold
+    assert label == "Excellent"  # 100 >= 85
+
+
+def test_opportunities_sharpe_null_on_zero_volatility(client, mock_db):
+    """Market with zero deposit volatility → sharpe: null, not an error."""
+    mocks = _loop_opportunity_mocks()
+    # Override deposit_vol_result (index 5) to return zero volatility
+    zero_vol = MagicMock()
+    zero_vol.all.return_value = [(MOCK_MARKET_ID, 0.0)]
+    mocks[5] = zero_vol
+
+    mock_db.execute = AsyncMock(side_effect=mocks)
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["sharpe"] is None
+
+
+def test_opportunities_sort_by_confidence(client, mock_db):
+    """?sort=confidence orders results by confidence desc (no error)."""
+    mock_db.execute = AsyncMock(side_effect=_loop_opportunity_mocks())
+
+    resp = client.get("/api/v1/opportunities?type=loop&sort=confidence")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) >= 1
+    # All items must have confidence
+    for item in data:
+        assert "confidence" in item
+
+
+def test_opportunities_sort_bogus_returns_400(client, mock_db):
+    """?sort=bogus → 400."""
+    resp = client.get("/api/v1/opportunities?type=loop&sort=bogus")
+    assert resp.status_code == 400
+
+
+def test_opportunities_history_keys_present(client, mock_db):
+    """Each item's history has today/yesterday/avg_7d/avg_30d keys."""
+    mock_db.execute = AsyncMock(side_effect=_loop_opportunity_mocks())
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    hist = data[0]["history"]
+    for key in ("today", "yesterday", "avg_7d", "avg_30d"):
+        assert key in hist, f"missing history key: {key}"

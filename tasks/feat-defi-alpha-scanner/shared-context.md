@@ -2,35 +2,38 @@
 # Shared Project Context
 
 ## Tech Stack
-- **Backend**: Python 3.12, FastAPI, Uvicorn, SQLAlchemy 2.0 (async), Alembic, asyncpg, web3.py, httpx, Pydantic v2
-- **Database**: PostgreSQL 16 + TimescaleDB extension (Docker image `timescale/timescaledb:pg16`)
-- **Frontend**: Next.js 15 (App Router), TypeScript, Tailwind CSS, shadcn/ui, TanStack Table, Recharts
-- **Package managers**: uv (backend, pyproject.toml + uv.lock), npm (frontend)
-- **Lint/format (backend)**: ruff (lint + format), black
+- **Backend**: FastAPI + SQLAlchemy async + Postgres + Alembic, Python 3.12. Config via `DEFI_*` env vars (`app/config.py`, pydantic-settings).
+- **Frontend**: Next.js 16, React 19, TypeScript, Tailwind v4, shadcn primitives. Installed libs: recharts, @tanstack/react-table, lucide-react, @base-ui/react, clsx/tailwind-merge/cva. **No react-query** — data fetched via `useState/useEffect + fetch` through `src/lib/api.ts`.
+- Calculations are pure functions with no I/O: `app/calculations/{looping,carry,ranker}.py`.
+
+## ⚠️ Frontend MANDATORY pre-read (every frontend task)
+Before writing ANY frontend code: if `frontend/node_modules` is absent run `npm install` (in `frontend/`), then read `frontend/AGENTS.md` and the bundled docs in `frontend/node_modules/next/dist/docs/`. **This is a modified Next.js 16 with breaking changes vs. training data.** Frontend code written from memory will be wrong (wrong APIs, conventions, file structure). Existing client components use the directives `"use client"` and (for TanStack Table) `"use no memo"` — mirror them.
 
 ## Test Infrastructure
-- **Framework**: pytest + pytest-asyncio
-- **Test command**: `pytest` (from `backend/` directory)
-- **File conventions**: `backend/tests/test_*.py`, co-located with source modules being tested
-- **Mocking**: `pytest-mock` for generic mocks; web3.py contract calls mocked at the `Contract.functions` boundary; httpx mocked via `respx` or `pytest-httpx`
+- **Framework**: pytest + pytest-asyncio (backend only).
+- **Test command**: `cd backend && pytest` (single file: `pytest tests/test_ranker.py`).
+- **File conventions**: `backend/tests/test_*.py`; shared fixtures in `backend/tests/conftest.py`. Existing: test_api, test_looping, test_carry, test_ranker, test_alerts, test_aave_adapter, test_hyperliquid_adapter.
+- **Frontend has NO test harness** — frontend tasks are implemented without tests (per Q6 decision). Do not stand one up.
 
 ## Conventions
-- All Python code under `backend/app/`, tests under `backend/tests/`
-- SQLAlchemy models in `backend/app/models/`, one file per logical entity
-- Pydantic request/response schemas in `backend/app/schemas/`
-- Collectors (external data adapters) under `backend/app/collectors/`
-- Pure calculation logic under `backend/app/calculations/` — deterministic, no I/O
-- API routes registered on a FastAPI `APIRouter` under `backend/app/api/`
-- Config via `pydantic-settings` BaseSettings, env var overrides with `DEFI_` prefix
-- All Docker services defined in root `docker-compose.yml`
+- Backend response models: Pydantic v2, `model_config = ConfigDict(from_attributes=True)`, no ORM leakage (`app/schemas/responses.py`).
+- API routes under `/api/v1` (`app/api/routes.py`), thin DB queries; batched queries to avoid N+1; deliberate simplifications marked with `# ponytail:` comments.
+- Models are one-class-per-file under `app/models/`, re-exported from `app/models/__init__.py`. UUID string PKs.
+- Frontend `src/lib/api.ts` types mirror the backend schemas exactly — keep them in sync when schemas change.
+- Ranker weights come from `RANKER_WEIGHTS` env JSON (parsed in `routes.py:_parse_ranker_weights`).
 
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `backend/pyproject.toml` | Dependencies (uv), ruff config, project metadata |
-| `backend/app/main.py` | FastAPI app factory, lifespan, CORS, router registration |
-| `backend/app/config.py` | Pydantic Settings: DB URL, RPC URL, Hyperliquid API, Telegram webhook, collector intervals |
-| `backend/app/db/session.py` | Async SQLAlchemy engine + session factory |
-| `backend/alembic/env.py` | Alembic migration runner (sync engine for DDL, reads config) |
-| `backend/alembic/versions/001_initial.py` | Initial migration — all tables, TimescaleDB extension, hypertables |
-| `docker-compose.yml` | Root compose: timescaledb, backend, frontend services |
+| `backend/app/api/routes.py` | All `/api/v1` endpoints; `_fetch_loop_opportunities` / `_fetch_carry_opportunities` build + score opportunities |
+| `backend/app/schemas/responses.py` | Pydantic response models (Loop/CarryOpportunityOut, HistoryPointOut, etc.) |
+| `backend/app/calculations/ranker.py` | `score_opportunities()` — computes 7 component scores, normalizes, weights, ranks (DISCARDS components today) |
+| `backend/app/calculations/looping.py` | `simulate_looping()` pure fn → effective_yield, leverage, safety_margin, liquidation_distance |
+| `backend/app/calculations/carry.py` | `calculate_carry()` pure fn → net_carry, risk_score |
+| `backend/app/config.py` | `Settings` — RANKER_WEIGHTS, DEFI_VOLATILITY_WINDOW, thresholds |
+| `backend/app/models/protocol.py` | Protocol model: id, name, type, chain, risk_score, created_at (created_at = ROW INSERT time, NOT launch date) |
+| `backend/tests/test_ranker.py` | Ranker test patterns + `_opp()` factory + `_DEFAULT_WEIGHTS` |
+| `frontend/src/lib/api.ts` | Typed API client; FundingSnapshotOut currently missing asset/protocol fields |
+| `frontend/src/app/page.tsx` | Landing page (to be rebuilt around feed + terminal hero) |
+| `frontend/src/components/funding-chart.tsx` | recharts LineChart (reusable pattern for detail-view charts) |
+| `frontend/src/components/ui/` | shadcn Button/Card/Input/Select/Table |

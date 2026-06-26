@@ -1,0 +1,1 @@
+- [asyncpg event loop fixture gotcha](gotchas.md) — engine must be created inside pytest fixture body, not module-level; otherwise "attached to a different loop" error

@@ -1,0 +1,1 @@
+- [DeFi Alpha Scanner build](project_defi_alpha_scanner.md) — 11-task decision engine feature; key decisions on rate_opportunities mutation, history_points proxy, page.tsx client component

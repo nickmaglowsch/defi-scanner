@@ -12,9 +12,11 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.calculations.carry import calculate_carry
+from app.calculations.history_agg import get_yield_history
 from app.calculations.looping import simulate_looping
 from app.calculations.orchestrator import ltv_params_from_snapshot
 from app.calculations.ranker import score_opportunities
+from app.calculations.rating import rate_opportunities, rerate_combined
 from app.config import settings
 from app.db.session import get_db
 from app.models import (
@@ -31,6 +33,7 @@ from app.schemas.responses import (
     HistoryPointOut,
     LoopOpportunityOut,
     ProtocolOut,
+    YieldHistoryOut,
 )
 
 logger = logging.getLogger("defi_scanner")
@@ -84,6 +87,9 @@ def _make_opportunity_dict(
 # ── GET /opportunities ────────────────────────────────────────────────────────
 
 
+_VALID_SORTS = {"return", "risk", "confidence", "sharpe", "liquidity"}
+
+
 @router.get("/opportunities")
 async def get_opportunities(
     type: str = Query(default="all"),
@@ -92,11 +98,17 @@ async def get_opportunities(
     min_yield: float = Query(default=0.0),
     min_liquidity: float = Query(default=0.0),
     limit: int = Query(default=20, ge=1, le=100),
+    sort: str = Query(default="return"),
     db: AsyncSession = Depends(get_db),
 ) -> list[LoopOpportunityOut | CarryOpportunityOut]:
     """Return ranked opportunities (loop, carry, or all)."""
     if type not in ("all", "loop", "carry"):
         raise HTTPException(status_code=400, detail="type must be 'all', 'loop', or 'carry'")
+    if sort not in _VALID_SORTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"sort must be one of: {', '.join(sorted(_VALID_SORTS))}",
+        )
     results: list[LoopOpportunityOut | CarryOpportunityOut] = []
 
     if type in ("all", "loop"):
@@ -108,8 +120,21 @@ async def get_opportunities(
         carry_results = await _fetch_carry_opportunities(db, asset, protocol, min_yield)
         results.extend(carry_results)
 
-    # ponytail: sort combined results by score descending, apply limit
-    combined = sorted(results, key=lambda r: r.score, reverse=True)
+    # type=all merged two independently-rated batches (loop + carry) with their own
+    # min-max scales and medals — rerate on one shared scale so 🥇🥈🥉 are unique
+    # and the 0-100 ratings are comparable across types.
+    if type == "all":
+        rerate_combined(results)
+
+    # ponytail: sort key map — None values sort last (use -inf sentinel)
+    _sort_key = {
+        "return":     lambda r: r.score,
+        "risk":       lambda r: -(r.risk_score or 0.0),  # lower risk first
+        "confidence": lambda r: r.confidence or 0.0,
+        "sharpe":     lambda r: r.sharpe if r.sharpe is not None else -1e9,
+        "liquidity":  lambda r: r.score,  # ponytail: proxy until liquidity field exposed
+    }
+    combined = sorted(results, key=_sort_key[sort], reverse=True)
     return combined[:limit]
 
 
@@ -468,6 +493,24 @@ async def _fetch_loop_opportunities(
 
     ranked = score_opportunities(loop_opps, weights)
 
+    # Attach _history_points for confidence calculation (len of history entries).
+    # Fetch history aggregates (batched) for deposit_apy on lending_snapshots.
+    # ponytail: sequential, not asyncio.gather — a shared AsyncSession can't run
+    # two queries concurrently. Use distinct sessions if this ever needs overlap.
+    history_map = await get_yield_history(db, market_ids, "lending_snapshots", "deposit_apy")
+
+    # Deposit APY volatility for Sharpe computation (batched).
+    deposit_vol_map = await _volatility_map(db, market_ids, source="lending")
+
+    for r in ranked:
+        snap = r["_snap"]
+        mid = snap.market_id
+        hist = history_map.get(mid, {})
+        # ponytail: count non-null avg_30d as proxy for data depth; fallback 0
+        r["_history_points"] = 1 if hist.get("avg_30d") is not None else 0
+
+    rate_opportunities(ranked)
+
     filtered = [
         r
         for r in ranked
@@ -479,10 +522,16 @@ async def _fetch_loop_opportunities(
     for r in filtered:
         calc = r["_calc"]
         snap = r["_snap"]
+        mid = snap.market_id
+        hist = history_map.get(mid)
+        dep_vol = deposit_vol_map.get(mid, 0.0)
+        eff_yield = calc.get("effective_yield") or 0.0
+        sharpe = (eff_yield / dep_vol) if dep_vol else None
         out.append(
             LoopOpportunityOut(
                 protocol=r["_protocol"],
                 asset=r["_asset"],
+                market_id=mid,
                 deposit_apy=snap.deposit_apy,
                 borrow_apy=snap.borrow_apy,
                 effective_yield=calc.get("effective_yield"),
@@ -492,6 +541,14 @@ async def _fetch_loop_opportunities(
                 risk_score=calc.get("risk_score"),
                 score=r["score"],
                 rank=r["rank"],
+                breakdown=r.get("breakdown"),
+                weights=r.get("weights"),
+                rating=r.get("rating"),
+                rating_label=r.get("rating_label"),
+                confidence=r.get("confidence"),
+                medal=r.get("medal"),
+                sharpe=sharpe,
+                history=YieldHistoryOut(**hist) if hist else None,
             )
         )
     return out
@@ -617,6 +674,7 @@ async def _fetch_carry_opportunities(
             "protocol_risk": protocol.risk_score,
             "_protocol": protocol.name,
             "_asset": market.asset,
+            "_market_id": snap.market_id,
             "_calc": calc,
         }
         carry_opps.append(opp)
@@ -625,6 +683,19 @@ async def _fetch_carry_opportunities(
         return []
 
     ranked = score_opportunities(carry_opps, weights)
+
+    # Fetch annualized_funding history for carry markets (batched).
+    history_map = await get_yield_history(
+        db, market_ids, "funding_snapshots", "annualized_funding"
+    )
+
+    for r in ranked:
+        # _snap is not stored on carry opps — use market_id from the funding snap directly
+        mid = r.get("_market_id", "")
+        hist = history_map.get(mid, {})
+        r["_history_points"] = 1 if hist.get("avg_30d") is not None else 0
+
+    rate_opportunities(ranked)
 
     filtered = [
         r
@@ -635,10 +706,16 @@ async def _fetch_carry_opportunities(
     out: list[CarryOpportunityOut] = []
     for r in filtered:
         calc = r["_calc"]
+        mid = r.get("_market_id", "")
+        hist = history_map.get(mid)
+        funding_vol = vol_map.get(mid, 0.0)
+        net_carry = calc.get("net_carry") or 0.0
+        sharpe = (net_carry / funding_vol) if funding_vol else None
         out.append(
             CarryOpportunityOut(
                 protocol=r["_protocol"],
                 asset=r["_asset"],
+                market_id=mid or None,
                 funding_yield=calc.get("funding_yield"),
                 spot_yield=calc.get("spot_yield"),
                 borrow_cost=calc.get("borrow_cost"),
@@ -647,6 +724,14 @@ async def _fetch_carry_opportunities(
                 risk_score=calc.get("risk_score"),
                 score=r["score"],
                 rank=r["rank"],
+                breakdown=r.get("breakdown"),
+                weights=r.get("weights"),
+                rating=r.get("rating"),
+                rating_label=r.get("rating_label"),
+                confidence=r.get("confidence"),
+                medal=r.get("medal"),
+                sharpe=sharpe,
+                history=YieldHistoryOut(**hist) if hist else None,
             )
         )
     return out
@@ -673,19 +758,34 @@ async def _latest_lending_by_asset(db: AsyncSession) -> dict[str, tuple[float, f
     return out
 
 
-async def _volatility_map(db: AsyncSession, market_ids: set[str]) -> dict[str, float]:
-    """Batched volatility (STDDEV of last N funding rates) for many markets at once."""
+# Trusted (table, column) pairs for volatility queries — keyed by a literal source
+# arg, never user input, so interpolating them into SQL is safe.
+_VOLATILITY_SOURCES = {
+    "funding": ("funding_snapshots", "funding_rate"),
+    "lending": ("lending_snapshots", "deposit_apy"),
+}
+
+
+async def _volatility_map(
+    db: AsyncSession, market_ids: set[str], source: str = "funding"
+) -> dict[str, float]:
+    """Batched volatility (STDDEV of the last N values) for many markets at once.
+
+    `source` selects the snapshot table/column: "funding" (funding_rate) for carry,
+    "lending" (deposit_apy) for loop Sharpe.
+    """
     if not market_ids:
         return {}
+    table, field = _VOLATILITY_SOURCES[source]
     window = settings.DEFI_VOLATILITY_WINDOW
     # DistinctON-style: latest N rows per market, then stddev per market.
-    sql = text("""
-        SELECT market_id, STDDEV(funding_rate) AS vol
+    sql = text(f"""
+        SELECT market_id, STDDEV({field}) AS vol
         FROM (
-            SELECT market_id, funding_rate,
+            SELECT market_id, {field},
                    ROW_NUMBER() OVER (PARTITION BY market_id
                                       ORDER BY observed_at DESC) AS rn
-            FROM funding_snapshots
+            FROM {table}
             WHERE market_id = ANY(:market_ids)
         ) AS recent
         WHERE rn <= :window

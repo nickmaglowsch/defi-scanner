@@ -1,6 +1,6 @@
-# Task 08: Alert Engine & Telegram Notification
+# Task 08: Terminal-Style "Today's Best Opportunities" Hero
 
-- **Decisions**: Wired `run_alerts` into `collectors/__init__.py` as a background task alongside collectors rather than touching `main.py`, matching shared-context's preference. The alert engine runs on its own schedule (`ALERT_INTERVAL_SECONDS`, default 300s) separate from the collector cycle.
-- **Deviations**: `NotificationChannel` is a `Protocol` rather than an ABC — simpler and equally effective for duck-typing. Channel factory `get_channel` takes explicit `bot_token`/`chat_id` strings rather than a full config object — the two values are all Telegram needs.
-- **Trade-offs**: Query helpers (`_latest_lending`, etc.) are static methods on the engine instead of free functions. Could be extracted if reused elsewhere, but they're alert-specific queries right now.
-- **Risks**: The engine queries all markets every cycle. With hundreds of markets this could be slow — consider limiting to active markets or adding an index on `observed_at` + `market_id` if latency becomes a problem.
+- **Decisions**: Used inline dot character `●` styled with Tailwind color classes instead of emoji dots (🟢/🟡/🔴) — emoji render inconsistently across terminal-adjacent dark backgrounds. The `getRiskColor` class was mapped to `text-green-400/yellow-400/red-400` to stay consistent with the terminal palette (original uses 500 variants; 400 is lighter and reads better on `bg-zinc-950`).
+- **Deviations**: None from spec.
+- **Trade-offs**: `isLoop` type guard uses `"effective_yield" in opp` duck-typing rather than a `type` field — matches how the existing codebase distinguishes loop vs carry (no explicit discriminant field exists on the union).
+- **Risks**: `getRiskColor` returns CSS class strings like `text-green-500`; the dot-color mapping does a simple `.includes("green")` substring check. If that helper ever adds new classes with "green" in an unexpected position, the mapping could be wrong — but the helper is trivially small and stable.

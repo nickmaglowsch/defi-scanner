@@ -34,13 +34,23 @@ export interface FundingSnapshotOut {
   id: string;
   market_id: string;
   observed_at: string;
+  asset: string;
+  protocol: string;
   funding_rate: number | null;
+  funding_interval_hours: number | null;
   annualized_funding: number | null;
   open_interest: number | null;
   volume_24h: number | null;
   long_short_ratio: number | null;
   mark_price: number | null;
   index_price: number | null;
+}
+
+export interface YieldHistoryOut {
+  today: number | null;
+  yesterday: number | null;
+  avg_7d: number | null;
+  avg_30d: number | null;
 }
 
 export interface LoopOpportunityOut {
@@ -55,6 +65,16 @@ export interface LoopOpportunityOut {
   risk_score: number | null;
   score: number;
   rank: number;
+  // Task-04 enrichment fields
+  market_id?: string | null;
+  breakdown?: Record<string, number> | null;
+  weights?: Record<string, number> | null;
+  rating?: number | null;
+  rating_label?: string | null;
+  confidence?: number | null;
+  medal?: string | null;
+  sharpe?: number | null;
+  history?: YieldHistoryOut | null;
 }
 
 export interface CarryOpportunityOut {
@@ -68,11 +88,35 @@ export interface CarryOpportunityOut {
   risk_score: number | null;
   score: number;
   rank: number;
+  // Task-04 enrichment fields
+  market_id?: string | null;
+  breakdown?: Record<string, number> | null;
+  weights?: Record<string, number> | null;
+  rating?: number | null;
+  rating_label?: string | null;
+  confidence?: number | null;
+  medal?: string | null;
+  sharpe?: number | null;
+  history?: YieldHistoryOut | null;
 }
 
 export interface HistoryPointOut {
   observed_at: string;
   value: number;
+}
+
+// ── Opportunity union helpers ──────────────────────────────────────────────
+
+/** Discriminate a loop opportunity from a carry one. */
+export function isLoop(
+  opp: LoopOpportunityOut | CarryOpportunityOut
+): opp is LoopOpportunityOut {
+  return "effective_yield" in opp;
+}
+
+/** The headline yield for an opportunity: effective_yield for loops, net_carry for carries. */
+export function oppYield(opp: LoopOpportunityOut | CarryOpportunityOut): number | null {
+  return isLoop(opp) ? opp.effective_yield : opp.net_carry;
 }
 
 // ── Generic fetch wrapper ─────────────────────────────────────────────────
@@ -107,6 +151,7 @@ export interface OppParams {
   min_yield?: number;
   min_liquidity?: number;
   limit?: number;
+  sort?: string;
 }
 export async function getOpportunities(
   params?: OppParams

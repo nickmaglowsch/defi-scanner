@@ -1,16 +1,6 @@
-# Task 03: Aave V3 Lending Adapter & Collector
+# Task 03: Opportunity Rating Engine
 
-- **Decisions**:
-  - APY stored as percentage (e.g., 5.0 = 5%). This matches the PRD's dashboard display expectation.
-  - Token amounts stored as raw smallest-unit values (wei for ETH, 6-decimal for USDC). No normalisation applied — the ratio math (utilization) is correct regardless of decimals, and raw values allow the dashboard to format at the display layer.
-  - Configuration bit parsing follows the task spec exactly (LTV bits 16-31, liquidation threshold 32-47, reserve factor 0-15, ÷100). These values are included in raw_payload but not in separate snapshot columns (no schema columns exist for them).
-  - Collector upsert uses SELECT-then-INSERT rather than ON CONFLICT to avoid aborting the entire batch on unique violations. This is slightly less efficient but tolerant of concurrent writers.
-  - `raw_payload` stores string representations for large integers (uint256/uint128) to ensure JSONB compatibility. Hex for configuration.data, decimal strings for rates and token supplies.
-- **Deviations**: None. All required tests pass, all acceptance criteria met.
-- **Trade-offs**:
-  - Token supply fetching is sequential (aToken then debtToken) rather than parallel. Two sequential RPC calls per asset. Switched to gather() if latency becomes an issue — the retry wrapper already handles individual failures.
-  - Web3 constructor mocking required patching `Web3.__init__` (rather than the class-level `Web3` mock) because web3 internally does `isinstance(parent_module, Web3)` checks that fail on MagicMock instances. The `_fake_init` sets `self_w3.eth` so subsequent `self.w3.eth.contract()` calls resolve.
-  - Async session mocking uses a real `_FakeSessionCtx` class rather than MagicMock's `__aenter__` because Python's `async with` resolves `__aenter__` on the type, not the instance — instance-level AsyncMock assignment is silently ignored.
-- **Risks**:
-  - The `_AAVE_POOL_ABI` is hand-crafted minimal ABI. If Aave V3 upgrades its Pool interface, the embedded ABI may need updating. The `getReserveData` function signature is stable but not guaranteed forever.
-  - The `getReservesList()` call fetches ALL Aave reserves (100+ assets), then filters to tracked. This is a single RPC call so overhead is negligible, but the full list may grow over time.
+- **Decisions**: `rate_opportunities` sorts `scored` in-place by rating before assigning medals. This mutates the input list (same behavior as `score_opportunities` in ranker.py which also mutates in-place). Task-04 wiring should be aware the list order changes after calling this.
+- **Deviations**: None — formulas, thresholds, and constants match the PRD exactly.
+- **Trade-offs**: `PROTOCOL_METADATA` hardcodes 5 known protocols. An unknown protocol gets 2 extra stub penalties (age + audit unknown), matching the PRD's "treat as unknown" rule. Adding protocols later is a one-liner edit to the dict.
+- **Risks**: The test for `test_confidence_penalises_more_stubbed_inputs` depends on `"aave"` being in `PROTOCOL_METADATA` with `age_known=True, audit_known=True`. If that entry is removed or changed, the test will break.

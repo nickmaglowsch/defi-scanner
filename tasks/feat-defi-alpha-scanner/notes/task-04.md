@@ -1,10 +1,9 @@
-# Task 04: Hyperliquid Funding Adapter & Collector
+# Task 04: Wire Breakdown + History + Rating + Sharpe into the API
 
-- **Decisions**:
-  - HTTP retry uses `httpx.HTTPStatusError` + `asyncio.sleep` instead of building a dedicated retry utility. Matches the inline retry pattern in the Aave adapter (which uses `asyncio.to_thread` for sync web3 calls), adapted for async httpx.
-  - `long_short_ratio` hardcoded to `1.0` with a `ponytail:` comment — Hyperliquid's `/info` endpoint doesn't expose directional open interest. Ratio needs a separate data source.
-  - Adapter accepts an optional `httpx.AsyncClient` for dependency injection, enabling clean test mocking without `respx`.
-  - `raw_payload` stores only the per-market asset context dict (not the full API response), which is what the snapshot row represents. The full raw response can be recreated from the union of individual `raw_payload` fields if needed.
-- **Deviations**: None. Config `HYPERLIQUID_API_URL` was already present in `config.py` — no config change needed.
-- **Trade-offs**: Skipped `respx` as a test dependency since `pytest-mock` + `AsyncMock` on the injected client achieves the same with zero deps. If more complex HTTP mocking is needed later, add `respx` then.
-- **Risks**: Hyperliquid API response shape is validated leniently (checks list-of-2, dict keys). If the API pivots to a different envelope, the adapter returns `[]` with a warning log rather than crashing — safe, but may silently skip cycles. Monitor collector logs on deploy.
+- **Decisions**: Loop Sharpe uses `_volatility_map_lending` (new helper: STDDEV of `deposit_apy` from `lending_snapshots`) rather than reusing `_volatility_map` (which queries `funding_snapshots` — irrelevant for lending market_ids). Carry Sharpe reuses the existing `_volatility_map` since it operates on funding markets.
+- **Decisions**: `_history_points` for `rate_opportunities` confidence is set to `1` if `avg_30d` is non-null (data exists), `0` otherwise. This is a rough proxy — the spec said "count of history points available." Using a richer count would require a separate `COUNT(*)` SQL call per market; the binary present/absent signal is sufficient for the confidence formula since CONFIDENCE_VOLATILITY_WINDOW=20 needs real depth data (task-02's `get_yield_history` doesn't return raw counts, only aggregates).
+- **Decisions**: The `liquidity` sort falls back to score-based ordering as a proxy (`# ponytail:` comment included). A proper liquidity sort would need `available_liquidity` exposed on the response model — deferred until a consumer actually needs it.
+- **Decisions**: Added `_market_id` key to carry opp dicts (alongside existing `_protocol`, `_asset`) so `_fetch_carry_opportunities` can look up history and volatility by market_id after `score_opportunities` re-sorts the list.
+- **Deviations**: The existing `test_get_looping_returns_opportunities` test needed 2 extra mock execute side-effects added (history + deposit vol) — this is expected maintenance for an existing test, not a new test.
+- **Trade-offs**: `YieldHistoryOut` is a plain Pydantic model (not a `TypedDict`) to stay consistent with the rest of `responses.py`. Inline `dict` was considered but rejected — typed model gives frontend better documentation.
+- **Risks**: The `sort=risk` key uses `-(r.risk_score or 0.0)` with `reverse=True`, meaning lower risk_score sorts first. If a consumer expects higher risk_score = worse, this is correct; if risk_score semantics change, revisit.

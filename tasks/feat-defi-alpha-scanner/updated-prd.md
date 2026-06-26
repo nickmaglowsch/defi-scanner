@@ -1,326 +1,70 @@
-# Updated PRD — DeFi Alpha Scanner (MVP Vertical Slice)
+# Updated PRD — DeFi Alpha Scanner: Decision Engine
 
-## Scope
+The product currently looks like DefiLlama (a data explorer). It must become Bloomberg + TradingView — a **decision-making tool**. This PRD grounds the original 10 sections + the killer Rating Engine in the actual codebase.
 
-A read-only intelligence platform scanning DeFi lending protocols and perpetual exchanges for yield opportunities. This MVP vertical slice delivers the full architecture shape end-to-end: data collection → normalized storage → calculation engine → REST API → dashboard. Only one lending adapter (Aave V3, on-chain via web3.py) and one funding adapter (Hyperliquid, REST via httpx). Architecture is provider-pluggable — adding Morpho, Spark, GMX, Drift, Vertex later is a single interface implementation each.
+## What already exists (do NOT rebuild)
+- **Unified opportunity backend**: `GET /api/v1/opportunities` already merges loop + carry with filters (type, asset, protocol, min_yield, min_liquidity, limit) and sorts by score. `/looping`, `/funding`, `/history`, `/protocols`, `/assets` exist.
+- **Component scoring**: `ranker.py:score_opportunities()` already computes 7 component scores (yield, liquidity, tvl, stability, utilization_penalty, volatility_penalty, protocol_risk), min-max normalizes, weighted-sums, ranks. **It discards the normalized components** — only `score`/`rank` survive (~lines 50-67). PRD #5 needs them plumbed OUT, not recomputed.
+- **Calc engines**: `simulate_looping()` (effective_yield, leverage, safety_margin, liquidation_distance, risk_score) and `calculate_carry()` (net_carry, risk_score) are pure functions, results cached in `LoopCalculation`/`CarryCalculation`.
+- **History data**: `lending_snapshots` (deposit_apy, borrow_apy, utilization, tvl, available_liquidity) and `funding_snapshots` (funding_rate, annualized_funding, open_interest, volume_24h) are time-series indexed by `market_id + observed_at`. Used today by `/history` for funding/lending fields.
+- **Volatility infra**: `routes.py:_volatility_map()` computes windowed STDDEV of funding_rate per market (window = `DEFI_VOLATILITY_WINDOW`, default 20). Reusable for Sharpe + confidence.
+- **Frontend**: recharts, @tanstack/react-table, lucide-react, shadcn UI all installed; `src/lib/api.ts` typed client; `funding-chart.tsx` recharts LineChart pattern.
 
-## Tech Stack (Python Pivot)
+## Constraints accepted by the user (stubbed / deferred data)
+Protocol **age**, **audit history**, and opportunity **persistence** are NOT collected today and **no new collectors will be built** for them now.
+- `Protocol.created_at` is row-insert time (when our seeder ran), **NOT** protocol launch date — must not be used as a real age proxy.
+- Use a **static stubbed protocols-metadata source** (a Python map keyed by protocol name) for age + audit fields.
+- Persistence/volatility are derived from existing snapshot history where possible.
+- Rating **confidence** is therefore partly synthetic until those data sources exist. This is accepted and must be surfaced honestly: stubbed-heavy opportunities read **lower confidence**.
 
-| Layer | Technology | Notes |
-|-------|-----------|-------|
-| Backend | Python 3.12, FastAPI, Uvicorn | Replaces Java/Spring Boot |
-| ORM | SQLAlchemy 2.0 (async) + asyncpg | Async throughout |
-| Migrations | Alembic | Sync engine for DDL |
-| Aave data | web3.py + Ethereum RPC | On-chain `getReserveData()` per reserve |
-| Hyperliquid data | httpx (async HTTP) | `api.hyperliquid.xyz/info` |
-| Telegram alerts | httpx | POST to Telegram Bot API |
-| Frontend | Next.js 15, TypeScript, Tailwind, shadcn/ui, TanStack Table, Recharts | App Router |
-| Package mgmt | uv (backend, pyproject.toml), npm (frontend) | |
-| Lint/format | ruff + black | ruff does both; mypy optional, off by default |
-| Database | PostgreSQL 16 + TimescaleDB | `timescale/timescaledb:pg16` Docker image |
-| Dev orchestration | Docker Compose | root `docker-compose.yml`: timescaledb + backend + frontend |
-| Tests | pytest + pytest-asyncio | TDD for calculations; mock adapters for collector tests |
+## Decisions locked for this build
 
-## Architecture
+### Rating Engine (killer feature) — exact formulas
+Layered over the existing ranker output. For a batch of scored opportunities:
 
-```
-┌───────────┐    ┌───────────┐
-│ Aave V3   │    │Hyperliquid│
-│ (on-chain)│    │  (REST)   │
-└─────┬─────┘    └─────┬─────┘
-      │ web3.py        │ httpx
-      ▼                ▼
-┌─────────────────────────────────┐
-│         Collectors              │
-│  AaveV3Adapter  HyperliquidAdapter│
-│  (implements LendingProvider /  │
-│   FundingProvider protocols)    │
-└──────────────┬──────────────────┘
-               │ SQLAlchemy async
-               ▼
-┌─────────────────────────────────┐
-│   PostgreSQL + TimescaleDB      │
-│   lending_snapshots (hypertable)│
-│   funding_snapshots (hypertable)│
-│   loop_calculations             │
-│   carry_calculations            │
-│   protocols, markets, alerts    │
-└──────────────┬──────────────────┘
-               │
-      ┌────────┴────────┐
-      ▼                 ▼
-┌───────────┐    ┌──────────────┐
-│Calculation│    │   REST API   │
-│ Engine    │    │ 6 endpoints  │
-│ looping   │    │ FastAPI      │
-│ carry     │    │ routes       │
-│ ranker    │    └──────┬───────┘
-└───────────┘           │ JSON
-                        ▼
-               ┌────────────────┐
-               │ Next.js Dashboard│
-               │ Home cards      │
-               │ Loop table      │
-               │ Carry table     │
-               │ Funding chart   │
-               └────────────────┘
+- **Score 0-100 (RELATIVE)**: `rating = (raw_score - min_raw_score) / (max_raw_score - min_raw_score) * 100` across the current batch, so the top opportunity ≈ 100. If the batch range is 0 (all equal), all get 100. This is intentionally relative — a weak day can still show a 100; documented so the UI is deterministic.
+- **Label thresholds** on `rating`:
+  - Excellent ≥ 85
+  - Very Good ≥ 70
+  - Good ≥ 55
+  - Fair ≥ 40
+  - Avoid < 40
+- **Confidence % (0-100)** = `base × completeness_factor × depth_factor`, clamped to [0, 100]:
+  - `base = 100`
+  - `completeness_factor`: start at 1.0; subtract **0.15 for each stubbed input** used (protocol age, audit history, persistence) → min floor 0.4. (3 stubbed inputs → 1.0 − 0.45 = 0.55.)
+  - `depth_factor`: based on number of historical snapshot points `n` available for the opportunity's market. `depth_factor = min(1.0, n / N)` where `N = DEFI_VOLATILITY_WINDOW` (20). Thin history (e.g. n=4) → 0.2 factor.
+  - Result: a fresh opportunity with all 3 stubbed inputs and thin history reads visibly low confidence (e.g. 0.55 × 0.2 × 100 ≈ 11%); a mature, well-populated one approaches the completeness ceiling (~55% when all 3 inputs remain stubbed). When real age/audit/persistence data arrives, drop the corresponding completeness penalty.
+- **Leaderboard**: opportunities sorted by `rating` desc; top 3 get 🥇🥈🥉 medals. Output row = {rank/medal, strategy label, expected_return, risk_label, confidence}.
 
-┌───────────┐
-│Alerts Engine│──► Telegram webhook (real)
-│              │──► Email/Discord/Slack (stub → log)
-└──────────────┘
-```
+### Sharpe (APPROXIMATE)
+`sharpe ≈ expected_net_yield / apy_volatility`, where apy_volatility = STDDEV of recent values (deposit_apy for loops, funding_rate for carry) over the volatility window. When volatility is 0/unknown, omit Sharpe (null) rather than divide by zero. UI labels it **"approx"**. Kept as a sort option.
 
-## Monorepo Layout
+### Capital Simulator
+Global capital value, default **$20,000**, persisted in **localStorage**, exposed via a React context provider at the app root. Every opportunity card converts its expected return %: `$ / year = capital × return%/100`, `$ / month = that / 12`.
 
-```
-defi-scanner/
-├── backend/
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py              # FastAPI app, lifespan, CORS
-│   │   ├── config.py            # pydantic-settings, env vars
-│   │   ├── db/
-│   │   │   ├── __init__.py
-│   │   │   └── session.py       # async engine + session factory
-│   │   ├── models/              # SQLAlchemy ORM models
-│   │   │   ├── __init__.py
-│   │   │   ├── protocol.py
-│   │   │   ├── market.py
-│   │   │   ├── lending_snapshot.py
-│   │   │   ├── funding_snapshot.py
-│   │   │   ├── loop_calculation.py
-│   │   │   ├── carry_calculation.py
-│   │   │   └── alert.py
-│   │   ├── schemas/             # Pydantic response models
-│   │   │   ├── __init__.py
-│   │   │   └── responses.py
-│   │   ├── collectors/          # External data adapters
-│   │   │   ├── __init__.py
-│   │   │   ├── base.py          # LendingProvider, FundingProvider protocols
-│   │   │   ├── aave.py          # Aave V3 on-chain adapter
-│   │   │   ├── hyperliquid.py   # Hyperliquid REST adapter
-│   │   │   ├── lending.py       # Lending collector service (orchestrates adapters)
-│   │   │   └── funding.py       # Funding collector service
-│   │   ├── calculations/        # Pure deterministic math
-│   │   │   ├── __init__.py
-│   │   │   ├── looping.py       # Leveraged looping simulator
-│   │   │   ├── carry.py         # Carry trade calculator
-│   │   │   └── ranker.py        # Opportunity scoring + ranking
-│   │   ├── api/
-│   │   │   ├── __init__.py
-│   │   │   └── routes.py        # All 6 endpoints (ponytail: single file)
-│   │   └── alerts/
-│   │       ├── __init__.py
-│   │       ├── engine.py        # Threshold evaluation, alert firing
-│   │       └── channels.py      # Telegram (real) + stub Email/Discord/Slack
-│   ├── alembic/
-│   │   ├── env.py
-│   │   ├── script.py.mako
-│   │   └── versions/
-│   │       └── 001_initial.py
-│   ├── tests/
-│   │   ├── __init__.py
-│   │   ├── conftest.py
-│   │   ├── test_aave_adapter.py
-│   │   ├── test_hyperliquid_adapter.py
-│   │   ├── test_looping.py
-│   │   ├── test_carry.py
-│   │   ├── test_ranker.py
-│   │   ├── test_api.py
-│   │   └── test_alerts.py
-│   ├── pyproject.toml
-│   └── uv.lock
-├── frontend/
-│   ├── src/
-│   │   ├── app/
-│   │   │   ├── layout.tsx
-│   │   │   └── page.tsx
-│   │   ├── components/
-│   │   │   ├── home-cards.tsx
-│   │   │   ├── loop-table.tsx
-│   │   │   ├── carry-table.tsx
-│   │   │   └── funding-chart.tsx
-│   │   └── lib/
-│   │       └── api.ts
-│   ├── package.json
-│   ├── tailwind.config.ts
-│   └── tsconfig.json
-├── docker-compose.yml
-└── .gitignore
-```
+### Old tables: DELETE & REBUILD
+Remove `loop-table.tsx` and `carry-table.tsx`; rebuild `page.tsx` around the new unified feed + terminal-style "Today's Best Opportunities" hero. `funding-chart.tsx` LineChart logic may be reused inside the detail view; otherwise delete. No `/classic` fallback route.
 
-## Database Schema
+### Deep links
+Static hardcoded protocol-name → app-URL map. Show "Open in <protocol> →" only when the protocol is in the map; hide otherwise. No schema change, no new collector.
 
-### protocols
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| name | VARCHAR UNIQUE | e.g. "Aave V3", "Hyperliquid" |
-| type | VARCHAR | 'lending' or 'derivatives' |
-| chain | VARCHAR | e.g. "ethereum" |
-| risk_score | FLOAT | hardcoded protocol risk (0-10) |
-| created_at | TIMESTAMPTZ | |
+### TDD: BACKEND ONLY
+Backend tasks (Rating Engine, score-breakdown plumbing, history aggregation, schema/API changes) use TDD (RED → GREEN → REFACTOR) with pytest. Frontend tasks have no tests (no harness exists; not standing one up).
 
-### markets
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| protocol_id | UUID FK → protocols | |
-| asset | VARCHAR | e.g. "USDC" |
-| market_type | VARCHAR | 'lending' or 'perp' |
-| created_at | TIMESTAMPTZ | |
-
-### lending_snapshots (TimescaleDB hypertable on `observed_at`)
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| market_id | UUID FK → markets | |
-| observed_at | TIMESTAMPTZ NOT NULL | hypertable partition key |
-| deposit_apy | FLOAT | % annualized |
-| borrow_apy | FLOAT | % annualized |
-| utilization | FLOAT | borrow / supply ratio |
-| available_liquidity | FLOAT | |
-| total_supplied | FLOAT | |
-| total_borrowed | FLOAT | |
-| tvl | FLOAT | |
-| raw_payload | JSONB | full on-chain response for recalc |
-
-### funding_snapshots (TimescaleDB hypertable on `observed_at`)
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| market_id | UUID FK → markets | |
-| observed_at | TIMESTAMPTZ NOT NULL | hypertable partition key |
-| funding_rate | FLOAT | raw decimal per interval |
-| funding_interval_hours | FLOAT | e.g. 1 for Hyperliquid |
-| annualized_funding | FLOAT | computed: rate * 8760 / interval |
-| open_interest | FLOAT | |
-| volume_24h | FLOAT | |
-| long_short_ratio | FLOAT | |
-| mark_price | FLOAT | |
-| index_price | FLOAT | |
-| raw_payload | JSONB | full REST response for recalc |
-
-### loop_calculations
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| lending_snapshot_id | UUID FK → lending_snapshots | |
-| calc_version | VARCHAR | "loop-v1" |
-| created_at | TIMESTAMPTZ | |
-| input_capital | FLOAT | |
-| input_target_ltv | FLOAT | |
-| input_safety_buffer | FLOAT | |
-| input_max_loops | INT | |
-| deposited_capital | FLOAT | output |
-| borrowed_capital | FLOAT | output |
-| net_apy | FLOAT | output |
-| effective_yield | FLOAT | output |
-| leverage | FLOAT | output |
-| safety_margin | FLOAT | output |
-| liquidation_distance | FLOAT | output |
-| risk_score | FLOAT | output |
-
-### carry_calculations
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| funding_snapshot_id | UUID FK → funding_snapshots | |
-| lending_snapshot_id | UUID FK → lending_snapshots (nullable) | |
-| calc_version | VARCHAR | "carry-v1" |
-| created_at | TIMESTAMPTZ | |
-| spot_yield | FLOAT | |
-| funding_yield | FLOAT | |
-| borrow_cost | FLOAT | |
-| trading_fees | FLOAT | |
-| net_carry | FLOAT | output |
-| risk_score | FLOAT | output |
-| expected_annual_return | FLOAT | output |
-
-### alerts
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| alert_type | VARCHAR | 'loop_yield', 'funding_rate', 'net_carry', 'borrow_apy' |
-| threshold_value | FLOAT | |
-| triggered_value | FLOAT | |
-| market_id | UUID FK → markets | |
-| snapshot_id | UUID | (nullable, whichever triggered) |
-| channel | VARCHAR | 'telegram','email','discord','slack' |
-| status | VARCHAR | 'fired', 'acknowledged' |
-| fired_at | TIMESTAMPTZ | |
-| raw_message | TEXT | |
-
-## REST API Endpoints
-
-All under `/api/v1/`. No auth. CORS allows frontend origin (env-configurable).
-
-| Method | Path | Description | Query Params |
-|--------|------|-------------|-------------|
-| GET | `/opportunities` | Ranked opportunities (all types) | `type=loop|carry`, `asset`, `protocol`, `min_yield`, `min_liquidity`, `limit` |
-| GET | `/looping` | Loop opportunities (from loop_calculations) | `asset`, `protocol`, `min_yield`, `min_liquidity`, `limit` |
-| GET | `/funding` | Latest funding rates | `asset`, `protocol`, `limit` |
-| GET | `/history` | Historical snapshots/charts | `type=funding|lending`, `market_id`, `from`, `to`, `limit` |
-| GET | `/protocols` | List protocols | none |
-| GET | `/assets` | List assets | none |
-
-## Calculation Engine
-
-### Looping Simulator (calc_version: "loop-v1")
-Pure function. Inputs: deposit_apy, borrow_apy, max_ltv, liquidation_threshold, initial_capital, target_ltv, safety_buffer, max_loops. Simulates recursive deposit→borrow→deposit cycle. Outputs match `loop_calculations` columns above.
-
-### Carry Calculator (calc_version: "carry-v1")
-Pure function. Inputs: spot_yield, funding_yield, borrow_cost, trading_fees. Output: net_carry = funding_yield + spot_yield - borrow_cost - trading_fees. Risk score from volatility proxy.
-
-### Opportunity Ranker (configurable weights)
-Score = Σ(weight_i × normalized_metric_i). Metrics: yield_score, liquidity_score, tvl_score, stability_score, utilization_penalty, volatility_penalty, protocol_risk. Volatility = STDDEV of last 20 funding snapshots per market (neutral/zero during bootstrap <20 snapshots). Weights configurable via env or config dict.
-
-## Alert Engine
-
-Evaluates thresholds against latest snapshots + calculations on each collector cycle:
-- Loop Yield > X% → fire
-- Funding Rate > X% → fire
-- Net Carry > X% → fire
-- Borrow APY < X% → fire
-
-Channels: Telegram webhook (real impl via httpx POST to Bot API), Email/Discord/Slack (stub: log message, return silently).
-
-## Collectors
-
-Run on an asyncio loop with configurable interval in the FastAPI lifespan. Each cycle:
-1. Query external source (web3.py for Aave, httpx for Hyperliquid)
-2. Retry up to 3 times with exponential backoff (1s, 2s, 4s) on failure
-3. On exhaustion: log error, skip cycle
-4. On success: parse raw response, upsert protocol/market, insert snapshot with raw_payload
-
-## Decisions Log
-
-| # | Decision | Rationale |
-|---|----------|-----------|
-| Q1 | Flat root monorepo: `backend/` + `frontend/` | No monorepo tooling needed; builds are independent |
-| Q2 | Python 3.12 + FastAPI (pivot from Java/Spring Boot) | User directive; uv for deps, ruff for lint |
-| Q3 | npm for frontend | Ships with Node.js, sufficient for single package |
-| Q4 | Aave V3 on-chain via web3.py | User directive; requires RPC, ABI, RAY conversion |
-| Q5 | TimescaleDB extension (Docker image) | Hypertables for time-series snapshots; fallback to plain PG if extension absent |
-| Q6 | Retry + skip resilience | 3 retries with backoff; log and skip on exhaustion |
-| Q7 | No API auth | Read-only public data; CORS to frontend origin only |
-| Q8 | httpx for REST calls | Async, modern; web3.py for on-chain |
-| Q9 | Volatility = STDDEV of own funding snapshots | Zero-cost, improves over time; neutral until ≥20 snapshots |
-| Q10 | TDD for calculation logic | Test-first for looping, carry, ranker; test-after for adapters/API |
-| — | `raw_payload` JSONB column on snapshots | Single table, simpler than separate raw tables; full recalc-ability preserved |
-| — | All 6 API routes in single `routes.py` | Ponytail: one file, thin DB queries; split later if file exceeds ~300 lines |
-| — | `asyncio` loop in FastAPI lifespan for collectors | No extra scheduler dependency; APScheduler added later if needed |
-
-## Out of Scope (architecture seams preserved)
-
-- Morpho, Spark, GMX, Drift, Vertex collector implementations — interfaces exist (`LendingProvider`, `FundingProvider`); adding = one file each
-- Email/Discord/Slack real delivery — stub channels that log; Telegram is the one real channel
-- ECS Fargate, CloudWatch, GitHub Actions CI/CD — local `docker-compose.yml` only
-- Wallet connection, trading, execution, Phase 2-5
-- Multiple history charts — one (funding over time); rest are stubs
-- mypy type checking — off by default; ruff is sufficient for MVP
+## Feature mapping (PRD section → task)
+- #1 Opportunity Feed → task-09 (feed/screener page)
+- #2 Risk first-class → task-07 (opportunity card) + task-04 (rating/risk labels backend)
+- #3 Explain WHY (breakdown) → task-01 (expose component breakdown) + task-07 (card expandable)
+- #4 History today/yesterday/7D/30D → task-02 (backend aggregation) + task-07/task-10 (display)
+- #5 Opportunity Score ⭐/100 + weights → task-01 (breakdown) + task-04 (rating) + task-07 (display)
+- #6 Unified screener + sort → task-04 (Sharpe/rating in API + sort) + task-09 (page)
+- #7 Capital Simulator → task-06 (context) + task-07 (card conversion)
+- #8 Health Score (loops) → task-07 (card; data already in LoopOpportunityOut)
+- #9 Opportunity Details + charts + deep link → task-10
+- #10 Terminal hero "Today's Best" → task-08
+- Killer Rating Engine + leaderboard → task-03 (engine) + task-04 (wire to API) + task-11 (leaderboard UI)
 
 ## Open Questions
-
-_(None — all major decisions resolved by user answers above. Minor implementation details left to implementer judgment per task.)_
+_None blocking — all planning questions answered. Items below are non-blocking notes for the implementer / reviewer:_
+- The relative 0-100 rating means "Excellent" is always achievable even on a poor day. Accepted per Q1 (RELATIVE). If an absolute scale is later desired, only `task-03`'s normalization changes.
+- Sharpe is null when volatility is unavailable; the feed's Sharpe sort will push null-Sharpe rows to the bottom. Acceptable for v1.
