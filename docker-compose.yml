@@ -1,0 +1,46 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: defi
+      POSTGRES_PASSWORD: defi
+      POSTGRES_DB: defi_scanner
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U defi -d defi_scanner"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      DEFI_DATABASE_URL: postgresql+asyncpg://defi:defi@timescaledb:5432/defi_scanner
+      DEFI_RPC_URL: ${DEFI_RPC_URL}
+      DEFI_COLLECTOR_INTERVAL_SECONDS: ${DEFI_COLLECTOR_INTERVAL_SECONDS:-60}
+      DEFI_ALERT_INTERVAL_SECONDS: ${DEFI_ALERT_INTERVAL_SECONDS:-60}
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      # NEXT_PUBLIC_* is inlined into the browser bundle, so it must be the
+      # host-reachable URL — not the docker-internal `backend` hostname.
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    restart: unless-stopped
+
+volumes:
+  pgdata:
