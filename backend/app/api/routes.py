@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.calculations.carry import calculate_carry
 from app.calculations.looping import simulate_looping
+from app.calculations.orchestrator import ltv_params_from_snapshot
 from app.calculations.ranker import score_opportunities
 from app.config import settings
 from app.db.session import get_db
@@ -94,6 +95,8 @@ async def get_opportunities(
     db: AsyncSession = Depends(get_db),
 ) -> list[LoopOpportunityOut | CarryOpportunityOut]:
     """Return ranked opportunities (loop, carry, or all)."""
+    if type not in ("all", "loop", "carry"):
+        raise HTTPException(status_code=400, detail="type must be 'all', 'loop', or 'carry'")
     results: list[LoopOpportunityOut | CarryOpportunityOut] = []
 
     if type in ("all", "loop"):
@@ -137,8 +140,8 @@ async def get_funding(
     limit: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ) -> list[FundingSnapshotOut]:
-    """Return latest funding rate snapshots."""
-    # Subquery: latest observed_at per market
+    """Return latest funding rate snapshots with asset/protocol labels."""
+    # Latest funding snapshot per market (single query).
     max_ts = func.max(FundingSnapshot.observed_at).label("max_ts")
     sub = (
         select(FundingSnapshot.market_id, max_ts)
@@ -151,17 +154,53 @@ async def get_funding(
         .join(sub, FundingSnapshot.market_id == sub.c.market_id)
         .where(FundingSnapshot.observed_at == sub.c.max_ts)
     )
-
-    if asset:
-        # join markets to filter by asset
-        market_sub = select(Market.id).where(Market.asset.ilike(f"%{asset}%")).subquery()
-        query = query.where(FundingSnapshot.market_id.in_(market_sub))
-
     query = query.limit(limit)
     result = await db.execute(query)
-    rows = result.scalars().all()
+    snapshots = result.scalars().all()
 
-    return [FundingSnapshotOut.model_validate(r) for r in rows]
+    if not snapshots:
+        return []
+
+    # Single batched query for all markets + their protocols (avoids N+1).
+    market_ids = {s.market_id for s in snapshots}
+    mp_rows = await db.execute(
+        select(Market, Protocol).where(
+            Market.id.in_(market_ids), Market.protocol_id == Protocol.id
+        )
+    )
+    labels: dict[str, tuple[str, str]] = {}
+    for m, p in mp_rows.all():
+        labels[m.id] = (m.asset, p.name)
+
+    out: list[FundingSnapshotOut] = []
+    for snap in snapshots:
+        info = labels.get(snap.market_id)
+        if info is None:
+            continue
+        asset_name, protocol_name = info
+        # Apply filters in-memory (cheaper than a per-filter subquery join).
+        if asset and asset.lower() not in asset_name.lower():
+            continue
+        if protocol and protocol.lower() not in protocol_name.lower():
+            continue
+        out.append(
+            FundingSnapshotOut(
+                id=snap.id,
+                market_id=snap.market_id,
+                observed_at=snap.observed_at,
+                asset=asset_name,
+                protocol=protocol_name,
+                funding_rate=snap.funding_rate,
+                funding_interval_hours=snap.funding_interval_hours,
+                annualized_funding=snap.annualized_funding,
+                open_interest=snap.open_interest,
+                volume_24h=snap.volume_24h,
+                long_short_ratio=snap.long_short_ratio,
+                mark_price=snap.mark_price,
+                index_price=snap.index_price,
+            )
+        )
+    return out
 
 
 # ── GET /history ──────────────────────────────────────────────────────────────
@@ -308,20 +347,47 @@ async def _fetch_loop_opportunities(
         .join(sub, LendingSnapshot.market_id == sub.c.market_id)
         .where(LendingSnapshot.observed_at == sub.c.max_ts)
     )
-    # Filter by asset/protocol via market join if needed
-    # ponytail: eager-load market+protocol in a single query loop
     result = await db.execute(query)
     snapshots = result.scalars().all()
+
+    if not snapshots:
+        return []
+
+    # Single batched query for all markets + protocols (avoids N+1).
+    market_ids = {s.market_id for s in snapshots}
+    mp_rows = await db.execute(
+        select(Market, Protocol).where(
+            Market.id.in_(market_ids), Market.protocol_id == Protocol.id
+        )
+    )
+    markets: dict[str, Market] = {}
+    protocols: dict[str, Protocol] = {}
+    for m, p in mp_rows.all():
+        markets[m.id] = m
+        protocols[m.id] = p
+
+    # Single batched volatility query for all markets in this set.
+    vol_map = await _volatility_map(db, market_ids)
+
+    # Batch-load existing loop calculations instead of one query per snapshot.
+    snap_ids = [s.id for s in snapshots]
+    calc_rows = await db.execute(
+        select(LoopCalculation).where(
+            LoopCalculation.lending_snapshot_id.in_(snap_ids),
+            LoopCalculation.calc_version == "loop-v1",
+        )
+    )
+    calcs_by_snap: dict[str, LoopCalculation] = {
+        c.lending_snapshot_id: c for c in calc_rows.scalars().all()
+    }
 
     loop_opps: list[dict] = []
     weights = _parse_ranker_weights()
 
     for snap in snapshots:
-        market = await db.get(Market, snap.market_id)
-        if market is None:
-            continue
-        protocol = await db.get(Protocol, market.protocol_id)
-        if protocol is None:
+        market = markets.get(snap.market_id)
+        protocol = protocols.get(snap.market_id)
+        if market is None or protocol is None:
             continue
 
         # Apply filters
@@ -330,28 +396,20 @@ async def _fetch_loop_opportunities(
         if protocol_filter and protocol_filter.lower() not in protocol.name.lower():
             continue
 
-        # Check if calculation already exists for this snapshot
-        existing_calc = await db.execute(
-            select(LoopCalculation).where(
-                LoopCalculation.lending_snapshot_id == snap.id,
-                LoopCalculation.calc_version == "loop-v1",
-            )
-        )
-        calc_row = existing_calc.scalar_one_or_none()
+        max_ltv, liq_threshold = ltv_params_from_snapshot(snap)
+        calc_row = calcs_by_snap.get(snap.id)
 
         if calc_row is None:
-            # Run simulate_looping with default inputs
             calc = simulate_looping(
                 deposit_apy=snap.deposit_apy or 0.0,
                 borrow_apy=snap.borrow_apy or 0.0,
-                max_ltv=0.8,
-                liquidation_threshold=0.85,
+                max_ltv=max_ltv,
+                liquidation_threshold=liq_threshold,
                 initial_capital=10000.0,
                 target_ltv=0.7,
                 safety_buffer=0.95,
                 max_loops=20,
             )
-            # Persist calculation
             calc_row = LoopCalculation(
                 lending_snapshot_id=snap.id,
                 calc_version="loop-v1",
@@ -370,8 +428,8 @@ async def _fetch_loop_opportunities(
             )
             db.add(calc_row)
             await db.flush()
+            calcs_by_snap[snap.id] = calc_row
         else:
-            # Reconstruct calc dict from DB row
             calc = {
                 "calc_version": calc_row.calc_version,
                 "input_capital": calc_row.input_capital or 0.0,
@@ -388,10 +446,8 @@ async def _fetch_loop_opportunities(
                 "risk_score": calc_row.risk_score or 0.0,
             }
 
-        # Compute volatility penalty via windowed STDDEV
-        vol_penalty = await _volatility_penalty(db, snap.market_id)
+        vol_penalty = vol_map.get(snap.market_id, 0.0)
 
-        # Build opportunity dict for ranker
         opp = {
             "yield_score": calc.get("effective_yield", 0.0),
             "liquidity_score": snap.available_liquidity or 0.0,
@@ -400,7 +456,6 @@ async def _fetch_loop_opportunities(
             "utilization_penalty": snap.utilization or 0.0,
             "volatility_penalty": vol_penalty,
             "protocol_risk": protocol.risk_score,
-            # Cache for output
             "_protocol": protocol.name,
             "_asset": market.asset,
             "_calc": calc,
@@ -411,10 +466,8 @@ async def _fetch_loop_opportunities(
     if not loop_opps:
         return []
 
-    # Score via ranker
     ranked = score_opportunities(loop_opps, weights)
 
-    # Filter by min_yield / min_liquidity
     filtered = [
         r
         for r in ranked
@@ -422,7 +475,6 @@ async def _fetch_loop_opportunities(
         and (r.get("_snap") and (r["_snap"].available_liquidity or 0.0) >= min_liquidity)
     ]
 
-    # Build response models
     out: list[LoopOpportunityOut] = []
     for r in filtered:
         calc = r["_calc"]
@@ -467,15 +519,49 @@ async def _fetch_carry_opportunities(
     result = await db.execute(query)
     snapshots = result.scalars().all()
 
+    if not snapshots:
+        return []
+
+    # Single batched query for funding markets + protocols.
+    market_ids = {s.market_id for s in snapshots}
+    mp_rows = await db.execute(
+        select(Market, Protocol).where(
+            Market.id.in_(market_ids), Market.protocol_id == Protocol.id
+        )
+    )
+    markets: dict[str, Market] = {}
+    protocols: dict[str, Protocol] = {}
+    for m, p in mp_rows.all():
+        markets[m.id] = m
+        protocols[m.id] = p
+
+    # Build an asset -> (borrow_cost, spot_yield) map ONCE from the latest
+    # lending snapshot of every lending market. Avoids re-querying all lending
+    # snapshots inside the funding loop (the previous N+1 worst-case).
+    lend_by_asset = await _latest_lending_by_asset(db)
+
+    # Batch-load existing carry calculations.
+    snap_ids = [s.id for s in snapshots]
+    calc_rows = await db.execute(
+        select(CarryCalculation).where(
+            CarryCalculation.funding_snapshot_id.in_(snap_ids),
+            CarryCalculation.calc_version == "carry-v1",
+        )
+    )
+    calcs_by_snap: dict[str, CarryCalculation] = {
+        c.funding_snapshot_id: c for c in calc_rows.scalars().all()
+    }
+
+    # Batched volatility for all funding markets.
+    vol_map = await _volatility_map(db, market_ids)
+
     carry_opps: list[dict] = []
     weights = _parse_ranker_weights()
 
     for snap in snapshots:
-        market = await db.get(Market, snap.market_id)
-        if market is None:
-            continue
-        protocol = await db.get(Protocol, market.protocol_id)
-        if protocol is None:
+        market = markets.get(snap.market_id)
+        protocol = protocols.get(snap.market_id)
+        if market is None or protocol is None:
             continue
 
         if asset_filter and asset_filter.lower() not in market.asset.lower():
@@ -483,40 +569,9 @@ async def _fetch_carry_opportunities(
         if protocol_filter and protocol_filter.lower() not in protocol.name.lower():
             continue
 
-        # Find latest lending snapshot for same asset (cross-market borrowing cost)
-        borrow_cost = 0.0
-        spot_yield = 0.0
-        max_ts_lend = func.max(LendingSnapshot.observed_at).label("max_ts")
-        lend_sub = (
-            select(LendingSnapshot.market_id, max_ts_lend)
-            .group_by(LendingSnapshot.market_id)
-            .subquery()
-        )
-        lend_query = (
-            select(LendingSnapshot)
-            .join(lend_sub, LendingSnapshot.market_id == lend_sub.c.market_id)
-            .where(LendingSnapshot.observed_at == lend_sub.c.max_ts)
-        )
-        lend_result = await db.execute(lend_query)
-        lend_snaps = lend_result.scalars().all()
+        borrow_cost, spot_yield = lend_by_asset.get(market.asset, (0.0, 0.0))
 
-        # Find matching lending market by asset for borrow cost / spot yield
-        for ls in lend_snaps:
-            lm = await db.get(Market, ls.market_id)
-            if lm and lm.asset == market.asset:
-                borrow_cost = ls.borrow_apy or 0.0
-                spot_yield = ls.deposit_apy or 0.0
-                break
-
-        # Check for existing carry calculation
-        existing_calc = await db.execute(
-            select(CarryCalculation).where(
-                CarryCalculation.funding_snapshot_id == snap.id,
-                CarryCalculation.calc_version == "carry-v1",
-            )
-        )
-        calc_row = existing_calc.scalar_one_or_none()
-
+        calc_row = calcs_by_snap.get(snap.id)
         if calc_row is None:
             calc = calculate_carry(
                 spot_yield=spot_yield,
@@ -537,6 +592,7 @@ async def _fetch_carry_opportunities(
             )
             db.add(calc_row)
             await db.flush()
+            calcs_by_snap[snap.id] = calc_row
         else:
             calc = {
                 "calc_version": calc_row.calc_version,
@@ -549,7 +605,7 @@ async def _fetch_carry_opportunities(
                 "expected_annual_return": calc_row.expected_annual_return or 0.0,
             }
 
-        vol_penalty = await _volatility_penalty(db, snap.market_id)
+        vol_penalty = vol_map.get(snap.market_id, 0.0)
 
         opp = {
             "yield_score": calc.get("net_carry", 0.0),
@@ -596,26 +652,54 @@ async def _fetch_carry_opportunities(
     return out
 
 
-async def _volatility_penalty(db: AsyncSession, market_id: str) -> float:
-    """Compute volatility penalty via windowed STDDEV of funding_rate.
+async def _latest_lending_by_asset(db: AsyncSession) -> dict[str, tuple[float, float]]:
+    """Return {asset: (borrow_apy, deposit_apy)} from the latest lending snapshot per market."""
+    max_ts_l = func.max(LendingSnapshot.observed_at).label("max_ts")
+    lend_sub = (
+        select(LendingSnapshot.market_id, max_ts_l)
+        .group_by(LendingSnapshot.market_id)
+        .subquery()
+    )
+    lend_rows = await db.execute(
+        select(LendingSnapshot, Market.asset).join(
+            lend_sub, LendingSnapshot.market_id == lend_sub.c.market_id
+        ).where(LendingSnapshot.observed_at == lend_sub.c.max_ts).join(
+            Market, LendingSnapshot.market_id == Market.id
+        )
+    )
+    out: dict[str, tuple[float, float]] = {}
+    for snap, asset in lend_rows.all():
+        out[asset] = (snap.borrow_apy or 0.0, snap.deposit_apy or 0.0)
+    return out
 
-    Uses SQL window function: STDDEV(funding_rate) OVER (PARTITION BY market_id
-    ORDER BY observed_at ROWS 20 PRECEDING). Returns 0.0 if fewer than 20 rows
-    (neutral).
-    """
+
+async def _volatility_map(db: AsyncSession, market_ids: set[str]) -> dict[str, float]:
+    """Batched volatility (STDDEV of last N funding rates) for many markets at once."""
+    if not market_ids:
+        return {}
     window = settings.DEFI_VOLATILITY_WINDOW
+    # DistinctON-style: latest N rows per market, then stddev per market.
     sql = text("""
-        SELECT STDDEV(funding_rate) AS vol
+        SELECT market_id, STDDEV(funding_rate) AS vol
         FROM (
-            SELECT funding_rate
+            SELECT market_id, funding_rate,
+                   ROW_NUMBER() OVER (PARTITION BY market_id
+                                      ORDER BY observed_at DESC) AS rn
             FROM funding_snapshots
-            WHERE market_id = :market_id
-            ORDER BY observed_at DESC
-            LIMIT :window
+            WHERE market_id = ANY(:market_ids)
         ) AS recent
+        WHERE rn <= :window
+        GROUP BY market_id
     """)
-    result = await db.execute(sql, {"market_id": market_id, "window": window})
-    row = result.one_or_none()
-    if row is None or row[0] is None:
-        return 0.0
-    return float(row[0])
+    result = await db.execute(
+        sql, {"market_ids": list(market_ids), "window": window}
+    )
+    out: dict[str, float] = {}
+    for mid, vol in result.all():
+        out[mid] = float(vol) if vol is not None else 0.0
+    return out
+
+
+async def _volatility_penalty(db: AsyncSession, market_id: str) -> float:
+    """Compute volatility penalty via windowed STDDEV of funding_rate (single market)."""
+    return (await _volatility_map(db, {market_id})).get(market_id, 0.0)

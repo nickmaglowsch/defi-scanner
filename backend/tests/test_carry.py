@@ -180,7 +180,9 @@ def test_expected_annual_return_equals_net_carry():
         (0.0, -2.0, 1.0, 3.0),
     ]
     for spot, fund, borrow, fees in cases:
-        result = calculate_carry(spot_yield=spot, funding_yield=fund, borrow_cost=borrow, trading_fees=fees)
+        result = calculate_carry(
+            spot_yield=spot, funding_yield=fund, borrow_cost=borrow, trading_fees=fees
+        )
         assert result["expected_annual_return"] == pytest.approx(result["net_carry"]), (
             f"mismatch for inputs: spot={spot}, funding={fund}, borrow={borrow}, fees={fees}"
         )

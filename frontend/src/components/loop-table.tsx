@@ -60,12 +60,12 @@ const columns = [
   columnHelper.accessor("effective_yield", {
     header: "Effective Yield",
     cell: (info) => fmtPct(info.getValue()),
-    sortingFn: "alphanumeric",
+    sortingFn: "basic",
   }),
   columnHelper.accessor("score", {
     header: "Score",
     cell: (info) => info.getValue().toFixed(2),
-    sortingFn: "alphanumeric",
+    sortingFn: "basic",
   }),
 ];
 

@@ -579,6 +579,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "psycopg2-binary" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -590,7 +591,6 @@ dependencies = [
 dev = [
     { name = "black" },
     { name = "httpx" },
-    { name = "psycopg2-binary" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-mock" },
@@ -603,6 +603,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.29.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.27.0" },
+    { name = "psycopg2-binary", specifier = ">=2.9.12" },
     { name = "pydantic", specifier = ">=2.9.0" },
     { name = "pydantic-settings", specifier = ">=2.5.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.35" },
@@ -614,7 +615,6 @@ requires-dist = [
 dev = [
     { name = "black", specifier = ">=24.0.0" },
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "psycopg2-binary", specifier = ">=2.9.12" },
     { name = "pytest", specifier = ">=8.3.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "pytest-mock", specifier = ">=3.14.0" },

@@ -12,6 +12,11 @@ def calculate_carry(
     """Compute net carry from yield/cost components for a carry trade.
 
     All inputs are in percentage units (e.g., 5.0 = 5%).
+    risk_score is an unbounded non-negative heuristic (typical range ~[0, 5])
+    derived from funding and borrow-cost magnitudes. It is NOT a final 0..1
+    score — the opportunity ranker min-max normalizes it to [0, 1] before use.
+    Direct consumers of carry_calculations.risk_score should normalize or
+    treat it as a relative magnitude, not an absolute probability.
     """
     net_carry = spot_yield + funding_yield - borrow_cost - trading_fees
     # ponytail: simple heuristic, volatility from DB added by ranker (task-07)

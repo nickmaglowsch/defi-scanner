@@ -52,22 +52,22 @@ const columns = [
   columnHelper.accessor("funding_yield", {
     header: "Funding Rate",
     cell: (info) => fmtPct(info.getValue()),
-    sortingFn: "alphanumeric",
+    sortingFn: "basic",
   }),
   columnHelper.accessor("borrow_cost", {
     header: "Borrow Cost",
     cell: (info) => fmtPct(info.getValue()),
-    sortingFn: "alphanumeric",
+    sortingFn: "basic",
   }),
   columnHelper.accessor("net_carry", {
     header: "Net Carry",
     cell: (info) => fmtPct(info.getValue()),
-    sortingFn: "alphanumeric",
+    sortingFn: "basic",
   }),
   columnHelper.accessor("score", {
     header: "Score",
     cell: (info) => info.getValue().toFixed(2),
-    sortingFn: "alphanumeric",
+    sortingFn: "basic",
   }),
 ];
 

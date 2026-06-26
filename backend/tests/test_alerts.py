@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace, TracebackType
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -13,12 +13,10 @@ import pytest
 
 from app.alerts.channels import (
     LoggingChannel,
-    NotificationChannel,
     TelegramChannel,
     get_channel,
 )
 from app.alerts.engine import AlertEngine
-from app.models import Alert
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -50,7 +48,9 @@ def _make_result(*, scalars_all: list | None = None, scalar_one: object = None) 
 
 
 def _market_row(asset: str = "USDC", market_type: str = "lending") -> SimpleNamespace:
-    return SimpleNamespace(id=str(uuid4()), protocol_id=str(uuid4()), asset=asset, market_type=market_type)
+    return SimpleNamespace(
+        id=str(uuid4()), protocol_id=str(uuid4()), asset=asset, market_type=market_type
+    )
 
 
 def _lending_snap_row(
@@ -167,29 +167,46 @@ async def test_telegram_channel_returns_false_on_error():
 
 
 # ── Engine tests ────────────────────────────────────────────────────────────
+# The engine batches latest snapshot/calc queries into helper methods that
+# return maps keyed by market_id. We patch those helpers directly so tests
+# exercise threshold/dedup/channel logic without coupling to SQL mechanics.
+# `session.execute` is only called for the Market query + dedup lookups.
 
 
-def _engine_with_channel(
-    session_factory: MagicMock, channel: NotificationChannel | None = None
+def _session_factory_for_engine(session: MagicMock) -> MagicMock:
+    factory = MagicMock()
+    factory.return_value = _FakeSessionCtx(session)
+    return factory
+
+
+def _engine_with_session(
+    session: MagicMock, *, thresholds: dict[str, float] | None = None
 ) -> AlertEngine:
-    ch = channel or AsyncMock(send=AsyncMock(return_value=True))
+    ch = AsyncMock(send=AsyncMock(return_value=True))
     return AlertEngine(
-        session_factory=session_factory,
+        session_factory=_session_factory_for_engine(session),
         channels={"log": ch},
-        thresholds={
-            "borrow_apy": 3.0,
-            "funding_rate": 20.0,
-            "loop_yield": 10.0,
-            "net_carry": 12.0,
-        },
+        thresholds=thresholds
+        or {"borrow_apy": 3.0, "funding_rate": 20.0, "loop_yield": 10.0, "net_carry": 12.0},
         cooldown_minutes=60,
     )
 
 
-def _session_factory(session: MagicMock) -> MagicMock:
-    factory = MagicMock()
-    factory.return_value = _FakeSessionCtx(session)
-    return factory
+def _patch_batch_helpers(
+    engine: AlertEngine,
+    market: SimpleNamespace,
+    *,
+    lend: object | None = None,
+    fund: object | None = None,
+    loop_c: object | None = None,
+    carry_c: object | None = None,
+) -> None:
+    """Patch the engine's batched query helpers to return fixed maps."""
+    lend_map = {market.id: lend} if lend else {}
+    fund_map = {market.id: fund} if fund else {}
+    engine._latest_by_market = AsyncMock(side_effect=[lend_map, fund_map])
+    engine._latest_loop_map = AsyncMock(return_value=({market.id: loop_c} if loop_c else {}))
+    engine._latest_carry_map = AsyncMock(return_value=({market.id: carry_c} if carry_c else {}))
 
 
 @pytest.mark.asyncio
@@ -199,20 +216,16 @@ async def test_engine_fires_borrow_apy_alert_when_below_threshold():
     mock_session = AsyncMock()
     mock_session.add = MagicMock()
     mock_session.commit = AsyncMock()
-
+    # Only the Market query + a single dedup query call session.execute.
     mock_session.execute = AsyncMock(
         side_effect=[
-            _make_result(scalars_all=[market]),                          # Markets query
-            _make_result(scalar_one=_lending_snap_row(borrow_apy=1.0)),  # Latest lending
-            _make_result(scalar_one=None),                               # Latest funding → None
-            _make_result(scalar_one=None),                               # Latest loop → None
-            _make_result(scalar_one=None),                               # Latest carry → None
-            _make_result(scalar_one=None),                               # Dedup → None
+            _make_result(scalars_all=[market]),  # Markets query
+            _make_result(scalar_one=None),       # Dedup → no prior alert
         ]
     )
 
-    factory = _session_factory(mock_session)
-    engine = _engine_with_channel(factory)
+    engine = _engine_with_session(mock_session)
+    _patch_batch_helpers(engine, market, lend=_lending_snap_row(borrow_apy=1.0))
     alerts = await engine.evaluate()
 
     assert len(alerts) == 1
@@ -230,20 +243,10 @@ async def test_engine_no_alert_when_borrow_apy_above_threshold():
     mock_session = AsyncMock()
     mock_session.add = MagicMock()
     mock_session.commit = AsyncMock()
+    mock_session.execute = AsyncMock(side_effect=[_make_result(scalars_all=[market])])
 
-    mock_session.execute = AsyncMock(
-        side_effect=[
-            _make_result(scalars_all=[market]),
-            _make_result(scalar_one=_lending_snap_row(borrow_apy=5.0)),
-            _make_result(scalar_one=None),
-            _make_result(scalar_one=None),
-            _make_result(scalar_one=None),
-            _make_result(scalar_one=None),
-        ]
-    )
-
-    factory = _session_factory(mock_session)
-    engine = _engine_with_channel(factory)
+    engine = _engine_with_session(mock_session)
+    _patch_batch_helpers(engine, market, lend=_lending_snap_row(borrow_apy=5.0))
     alerts = await engine.evaluate()
 
     assert len(alerts) == 0
@@ -257,20 +260,15 @@ async def test_engine_fires_funding_alert_when_above_threshold():
     mock_session = AsyncMock()
     mock_session.add = MagicMock()
     mock_session.commit = AsyncMock()
-
     mock_session.execute = AsyncMock(
         side_effect=[
             _make_result(scalars_all=[market]),
-            _make_result(scalar_one=None),                                       # lending → None
-            _make_result(scalar_one=_funding_snap_row(annualized_funding=25.0)),  # Latest funding
-            _make_result(scalar_one=None),                                        # loop → None
-            _make_result(scalar_one=None),                                        # carry → None
-            _make_result(scalar_one=None),                                        # dedup → None
+            _make_result(scalar_one=None),  # dedup
         ]
     )
 
-    factory = _session_factory(mock_session)
-    engine = _engine_with_channel(factory)
+    engine = _engine_with_session(mock_session)
+    _patch_batch_helpers(engine, market, fund=_funding_snap_row(annualized_funding=25.0))
     alerts = await engine.evaluate()
 
     assert len(alerts) == 1
@@ -286,19 +284,15 @@ async def test_engine_dedup_skips_within_cooldown():
     mock_session = AsyncMock()
     mock_session.add = MagicMock()
     mock_session.commit = AsyncMock()
-
     mock_session.execute = AsyncMock(
         side_effect=[
             _make_result(scalars_all=[market]),
-            _make_result(scalar_one=_lending_snap_row(borrow_apy=1.0)),
-            _make_result(scalar_one=None),  # funding
-            _make_result(scalar_one=None),  # loop
-            _make_result(scalar_one=None),  # carry
             _make_result(scalar_one=existing),  # dedup → existing alert found
         ]
     )
 
-    engine = _engine_with_channel(_session_factory(mock_session))
+    engine = _engine_with_session(mock_session)
+    _patch_batch_helpers(engine, market, lend=_lending_snap_row(borrow_apy=1.0))
     alerts = await engine.evaluate()
 
     assert len(alerts) == 0
@@ -312,25 +306,21 @@ async def test_engine_channels_notified_on_fire():
     mock_session = AsyncMock()
     mock_session.add = MagicMock()
     mock_session.commit = AsyncMock()
-
     mock_session.execute = AsyncMock(
         side_effect=[
             _make_result(scalars_all=[market]),
-            _make_result(scalar_one=_lending_snap_row(borrow_apy=1.0)),
-            _make_result(scalar_one=None),
-            _make_result(scalar_one=None),
-            _make_result(scalar_one=None),
             _make_result(scalar_one=None),
         ]
     )
 
     mock_chan = AsyncMock(send=AsyncMock(return_value=True))
     engine = AlertEngine(
-        session_factory=_session_factory(mock_session),
+        session_factory=_session_factory_for_engine(mock_session),
         channels={"telegram": mock_chan, "log": mock_chan},
         thresholds={"borrow_apy": 3.0},
         cooldown_minutes=60,
     )
+    _patch_batch_helpers(engine, market, lend=_lending_snap_row(borrow_apy=1.0))
 
     await engine.evaluate()
 
@@ -345,19 +335,15 @@ async def test_engine_loop_yield_alert_fires():
     mock_session = AsyncMock()
     mock_session.add = MagicMock()
     mock_session.commit = AsyncMock()
-
     mock_session.execute = AsyncMock(
         side_effect=[
             _make_result(scalars_all=[market]),
-            _make_result(scalar_one=None),  # lending
-            _make_result(scalar_one=None),  # funding
-            _make_result(scalar_one=_loop_calc_row(effective_yield=15.0)),  # loop
-            _make_result(scalar_one=None),  # carry
-            _make_result(scalar_one=None),  # dedup
+            _make_result(scalar_one=None),
         ]
     )
 
-    engine = _engine_with_channel(_session_factory(mock_session))
+    engine = _engine_with_session(mock_session)
+    _patch_batch_helpers(engine, market, loop_c=_loop_calc_row(effective_yield=15.0))
     alerts = await engine.evaluate()
 
     assert len(alerts) == 1
@@ -372,19 +358,15 @@ async def test_engine_net_carry_alert_fires():
     mock_session = AsyncMock()
     mock_session.add = MagicMock()
     mock_session.commit = AsyncMock()
-
     mock_session.execute = AsyncMock(
         side_effect=[
             _make_result(scalars_all=[market]),
-            _make_result(scalar_one=None),  # lending
-            _make_result(scalar_one=None),  # funding
-            _make_result(scalar_one=None),  # loop
-            _make_result(scalar_one=_carry_calc_row(net_carry=14.0)),  # carry
-            _make_result(scalar_one=None),  # dedup
+            _make_result(scalar_one=None),
         ]
     )
 
-    engine = _engine_with_channel(_session_factory(mock_session))
+    engine = _engine_with_session(mock_session)
+    _patch_batch_helpers(engine, market, carry_c=_carry_calc_row(net_carry=14.0))
     alerts = await engine.evaluate()
 
     assert len(alerts) == 1
@@ -400,7 +382,7 @@ async def test_engine_no_markets_no_alerts():
     mock_session.commit = AsyncMock()
     mock_session.execute = AsyncMock(return_value=_make_result(scalars_all=[]))
 
-    engine = _engine_with_channel(_session_factory(mock_session))
+    engine = _engine_with_session(mock_session)
     alerts = await engine.evaluate()
 
     assert len(alerts) == 0

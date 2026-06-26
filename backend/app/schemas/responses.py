@@ -47,7 +47,10 @@ class FundingSnapshotOut(BaseModel):
     id: str
     market_id: str
     observed_at: datetime
+    asset: str
+    protocol: str
     funding_rate: float | None = None
+    funding_interval_hours: float | None = None
     annualized_funding: float | None = None
     open_interest: float | None = None
     volume_24h: float | None = None

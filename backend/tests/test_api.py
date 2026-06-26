@@ -94,6 +94,7 @@ def _funding_snapshot_row():
         market_id=MOCK_MARKET_ID,
         observed_at=datetime(2026, 1, 1, tzinfo=UTC),
         funding_rate=0.0001,
+        funding_interval_hours=1.0,
         annualized_funding=8.76,
         open_interest=1_000_000.0,
         volume_24h=50_000_000.0,
@@ -161,17 +162,52 @@ def test_get_assets_empty(client, mock_db):
 
 
 def test_get_funding_returns_list(client, mock_db):
-    """GET /api/v1/funding → 200 with populated list."""
+    """GET /api/v1/funding → 200 with asset/protocol labels populated."""
     snap = _funding_snapshot_row()
-    mock_result = MagicMock()
-    mock_result.scalars.return_value.all.return_value = [snap]
-    mock_db.execute.return_value = mock_result
+    market = SimpleNamespace(
+        id=MOCK_MARKET_ID, protocol_id=MOCK_PROTOCOL_ID, asset="ETH", market_type="perp"
+    )
+    protocol = SimpleNamespace(
+        id=MOCK_PROTOCOL_ID, name="Hyperliquid", type="funding", chain=None, risk_score=0.3
+    )
+
+    snap_result = MagicMock()
+    snap_result.scalars.return_value.all.return_value = [snap]
+
+    mp_result = MagicMock()
+    mp_result.all.return_value = [(market, protocol)]
+
+    mock_db.execute = AsyncMock(side_effect=[snap_result, mp_result])
 
     resp = client.get("/api/v1/funding?limit=3")
     assert resp.status_code == 200
     data = resp.json()
     assert isinstance(data, list)
     assert len(data) == 1
+    assert data[0]["asset"] == "ETH"
+    assert data[0]["protocol"] == "Hyperliquid"
+    assert data[0]["funding_interval_hours"] is not None
+
+
+def test_get_funding_protocol_filter_excludes_non_matching(client, mock_db):
+    """GET /api/v1/funding?protocol=Hyperliquid → excludes non-matching protocols."""
+    snap = _funding_snapshot_row()
+    market = SimpleNamespace(
+        id=MOCK_MARKET_ID, protocol_id=MOCK_PROTOCOL_ID, asset="ETH", market_type="perp"
+    )
+    protocol = SimpleNamespace(
+        id=MOCK_PROTOCOL_ID, name="GMX", type="funding", chain=None, risk_score=0.3
+    )
+
+    snap_result = MagicMock()
+    snap_result.scalars.return_value.all.return_value = [snap]
+    mp_result = MagicMock()
+    mp_result.all.return_value = [(market, protocol)]
+    mock_db.execute = AsyncMock(side_effect=[snap_result, mp_result])
+
+    resp = client.get("/api/v1/funding?protocol=Hyperliquid")
+    assert resp.status_code == 200
+    assert resp.json() == []
 
 
 # ── 4. GET /history ───────────────────────────────────────────────────────────
@@ -226,6 +262,73 @@ def test_get_looping_empty(client, mock_db):
     resp = client.get("/api/v1/looping")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+def _loop_calc_row():
+    """A pre-persisted LoopCalculation row (so the API uses stored results)."""
+    return SimpleNamespace(
+        id=str(uuid4()),
+        lending_snapshot_id=MOCK_SNAPSHOT_ID,
+        calc_version="loop-v1",
+        input_capital=10000.0,
+        input_target_ltv=0.7,
+        input_safety_buffer=0.95,
+        input_max_loops=20,
+        deposited_capital=26000.0,
+        borrowed_capital=16000.0,
+        net_apy=12.5,
+        effective_yield=12.5,
+        leverage=2.6,
+        safety_margin=0.15,
+        liquidation_distance=18.0,
+        risk_score=6.0,
+    )
+
+
+def test_get_looping_returns_opportunities(client, mock_db):
+    """GET /api/v1/looping → 200 with populated opportunity (happy path)."""
+    snap = SimpleNamespace(
+        id=MOCK_SNAPSHOT_ID,
+        market_id=MOCK_MARKET_ID,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        deposit_apy=5.0,
+        borrow_apy=3.0,
+        utilization=0.7,
+        available_liquidity=1_000_000.0,
+        total_supplied=5_000_000.0,
+        total_borrowed=3_500_000.0,
+        tvl=10_000_000.0,
+        raw_payload=None,
+    )
+    market = SimpleNamespace(
+        id=MOCK_MARKET_ID, protocol_id=MOCK_PROTOCOL_ID, asset="USDC", market_type="lending"
+    )
+    protocol = SimpleNamespace(
+        id=MOCK_PROTOCOL_ID, name="Aave V3", type="lending", chain="ethereum", risk_score=0.5
+    )
+    calc = _loop_calc_row()
+
+    snap_result = MagicMock()
+    snap_result.scalars.return_value.all.return_value = [snap]
+    mp_result = MagicMock()
+    mp_result.all.return_value = [(market, protocol)]
+    vol_result = MagicMock()
+    vol_result.all.return_value = []
+    calc_result = MagicMock()
+    calc_result.scalars.return_value.all.return_value = [calc]
+
+    mock_db.execute = AsyncMock(side_effect=[snap_result, mp_result, vol_result, calc_result])
+
+    resp = client.get("/api/v1/looping")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    opp = data[0]
+    assert opp["asset"] == "USDC"
+    assert opp["protocol"] == "Aave V3"
+    assert opp["effective_yield"] == pytest.approx(12.5)
+    assert "score" in opp
+    assert "rank" in opp
 
 
 # ── 6. GET /opportunities ─────────────────────────────────────────────────────

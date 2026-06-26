@@ -23,6 +23,25 @@ from app.models import (
 
 logger = logging.getLogger("defi_scanner")
 
+# Conservative fallbacks used when a reserve's on-chain config is missing.
+_DEFAULT_MAX_LTV = 0.8
+_DEFAULT_LIQ_THRESHOLD = 0.85
+
+
+def ltv_params_from_snapshot(snapshot: LendingSnapshot) -> tuple[float, float]:
+    """Extract (max_ltv, liquidation_threshold) as fractions from a snapshot's raw_payload.
+
+    The Aave adapter persists these as percentages (e.g. 80.0 = 80% LTV) under
+    raw_payload.configuration. Falls back to conservative defaults when absent.
+    """
+    raw = snapshot.raw_payload or {}
+    config = raw.get("configuration", {}) if isinstance(raw, dict) else {}
+    ltv_pct = config.get("ltv_pct")
+    liq_pct = config.get("liquidation_threshold_pct")
+    max_ltv = (float(ltv_pct) / 100.0) if isinstance(ltv_pct, (int, float)) else _DEFAULT_MAX_LTV
+    liq = (float(liq_pct) / 100.0) if isinstance(liq_pct, (int, float)) else _DEFAULT_LIQ_THRESHOLD
+    return max_ltv, liq
+
 
 async def trigger_loop_calculation(session: AsyncSession, snapshot: LendingSnapshot) -> None:
     """Run simulate_looping on a fresh lending snapshot and persist the result.
@@ -43,11 +62,13 @@ async def trigger_loop_calculation(session: AsyncSession, snapshot: LendingSnaps
     if market is None:
         return
 
+    max_ltv, liq_threshold = ltv_params_from_snapshot(snapshot)
+
     calc = simulate_looping(
         deposit_apy=snapshot.deposit_apy or 0.0,
         borrow_apy=snapshot.borrow_apy or 0.0,
-        max_ltv=0.8,
-        liquidation_threshold=0.85,
+        max_ltv=max_ltv,
+        liquidation_threshold=liq_threshold,
         initial_capital=10000.0,
         target_ltv=0.7,
         safety_buffer=0.95,
