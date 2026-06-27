@@ -12,8 +12,7 @@ import {
   getLooping,
   getOpportunities,
   getFunding,
-  LoopOpportunityOut,
-  CarryOpportunityOut,
+  OpportunityOut,
   FundingSnapshotOut,
 } from "@/lib/api";
 
@@ -98,13 +97,13 @@ function CardWrapper({
 }
 
 export default function HomeCards() {
-  const bestLoop = useCardFetch<LoopOpportunityOut>(() =>
+  const bestLoop = useCardFetch<OpportunityOut>(() =>
     getLooping({ limit: 1 }).then((r) => r[0])
   );
-  const bestCarry = useCardFetch<CarryOpportunityOut>(() =>
-    getOpportunities({ type: "carry", limit: 1 }).then((r) => r[0] as CarryOpportunityOut)
+  const bestCarry = useCardFetch<OpportunityOut>(() =>
+    getOpportunities({ type: "carry", limit: 1 }).then((r) => r[0])
   );
-  const stableYield = useCardFetch<LoopOpportunityOut>(() =>
+  const stableYield = useCardFetch<OpportunityOut>(() =>
     getLooping({ asset: "USDC", limit: 1 }).then((r) => r[0])
   );
   const highestFunding = useCardFetch<FundingSnapshotOut>(() =>
@@ -116,7 +115,7 @@ export default function HomeCards() {
       {/* Best Loop */}
       <CardWrapper
         title="Best Loop"
-        value={bestLoop.data ? fmtPct(bestLoop.data.effective_yield) : "—"}
+        value={bestLoop.data ? fmtPct(bestLoop.data.strategy_details?.effective_yield) : "—"}
         subtitle={
           bestLoop.data
             ? `${bestLoop.data.protocol} · ${bestLoop.data.asset}`
@@ -130,7 +129,7 @@ export default function HomeCards() {
       {/* Best Carry */}
       <CardWrapper
         title="Best Carry"
-        value={bestCarry.data ? fmtPct(bestCarry.data.net_carry) : "—"}
+        value={bestCarry.data ? fmtPct(bestCarry.data.strategy_details?.net_carry) : "—"}
         subtitle={
           bestCarry.data
             ? `${bestCarry.data.protocol} · ${bestCarry.data.asset}`
@@ -144,7 +143,7 @@ export default function HomeCards() {
       {/* Best Stable Yield */}
       <CardWrapper
         title="Best Stable Yield"
-        value={stableYield.data ? fmtPct(stableYield.data.effective_yield) : "—"}
+        value={stableYield.data ? fmtPct(stableYield.data.strategy_details?.effective_yield) : "—"}
         subtitle={
           stableYield.data
             ? `${stableYield.data.protocol} · ${stableYield.data.asset}`

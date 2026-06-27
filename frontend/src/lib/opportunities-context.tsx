@@ -1,9 +1,9 @@
 "use client";
 
 import { createContext, useContext, useEffect, useState } from "react";
-import { getOpportunities, type LoopOpportunityOut, type CarryOpportunityOut } from "@/lib/api";
+import { getOpportunities, type OpportunityOut } from "@/lib/api";
 
-type AnyOpp = LoopOpportunityOut | CarryOpportunityOut;
+type AnyOpp = OpportunityOut;
 
 interface OpportunitiesContextValue {
   // Base set: /opportunities?sort=return&limit=50 (top 50 by score == rating desc

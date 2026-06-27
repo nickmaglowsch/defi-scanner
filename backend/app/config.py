@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://defi:defi@localhost:5432/defi_scanner"
     RPC_URL: str = "https://eth.llamarpc.com"
     HYPERLIQUID_API_URL: str = "https://api.hyperliquid.xyz"
+    DYDX_INDEXER_URL: str = "https://indexer.dydx.trade"
     # ── Protocol metadata collectors (real confidence signals) ───────────────
     # DefiLlama's public /protocols list (no API key) supplies per-protocol
     # `address`, `chain`, and audit presence. Override to point at a mirror or
@@ -17,6 +18,9 @@ class Settings(BaseSettings):
     # How often the metadata collectors refresh. Deploy/audit info changes
     # rarely, so hourly is plenty and keeps free-RPC rate limits happy.
     DEFI_PROTOCOL_METADATA_INTERVAL_SECONDS: int = 3600
+    # Path to the human-editable protocol registry YAML. Override for tests
+    # or to point at a fork-specific registry without editing committed code.
+    DEFI_PROTOCOL_REGISTRY_PATH: str = ""
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
     FRONTEND_ORIGIN: str = "http://localhost:3000"
@@ -32,7 +36,9 @@ class Settings(BaseSettings):
     RANKER_WEIGHTS: str = (
         '{"yield_score": 1.0, "liquidity_score": 1.0, "tvl_score": 1.0, '
         '"stability_score": 1.0, "utilization_penalty": 1.0, '
-        '"volatility_penalty": 1.0, "protocol_risk": 1.0}'
+        '"volatility_penalty": 1.0, "protocol_risk": 1.0, '
+        '"cross_protocol_penalty": 0.3, "slashing_penalty": 0.3, '
+        '"bridge_penalty": 0.2, "maturity_penalty": 0.2}'
     )
     DEFI_VOLATILITY_WINDOW: int = 20
     ALERT_LOOP_YIELD_THRESHOLD: float = 10.0

@@ -1,0 +1,271 @@
+# Protocol registry — single source of truth for monitored deployments.
+# Adapters read this file via app.protocols.registry.load_registry().
+# Addresses marked with a `ponytail:` comment are placeholders pending research.
+version: "2026.06.26"
+registry:
+  # ── Lending ───────────────────────────────────────────────────────────────
+
+  - protocol: Aave V3
+    slug: aave-v3
+    type: lending
+    chain: ethereum
+    data_source: rpc
+    pool_address: "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
+    assets:
+      USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+      USDT: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+      DAI: "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+      WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+      wstETH: "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
+      WBTC: "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+
+  - protocol: Aave V3
+    slug: aave-v3
+    type: lending
+    chain: base
+    data_source: rpc
+    pool_address: "0xA238Dd80C2594Ffe268D154757e7fE2ebD2eB6D2"
+    # ponytail: Base asset addresses need verification
+    assets:
+      USDC: "0x0000000000000000000000000000000000000000"
+      WETH: "0x0000000000000000000000000000000000000000"
+
+  - protocol: Aave V3
+    slug: aave-v3
+    type: lending
+    chain: arbitrum
+    data_source: rpc
+    pool_address: "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+    # ponytail: Arbitrum asset addresses need verification
+    assets:
+      USDC: "0x0000000000000000000000000000000000000000"
+      WETH: "0x0000000000000000000000000000000000000000"
+
+  - protocol: Aave V3
+    slug: aave-v3
+    type: lending
+    chain: optimism
+    data_source: rpc
+    pool_address: "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+    # ponytail: Optimism asset addresses need verification
+    assets:
+      USDC: "0x0000000000000000000000000000000000000000"
+      WETH: "0x0000000000000000000000000000000000000000"
+
+  - protocol: Aave V3
+    slug: aave-v3
+    type: lending
+    chain: polygon
+    data_source: rpc
+    pool_address: "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+    # ponytail: Polygon asset addresses need verification
+    assets:
+      USDC: "0x0000000000000000000000000000000000000000"
+      WETH: "0x0000000000000000000000000000000000000000"
+
+  - protocol: Morpho
+    slug: morpho
+    type: lending
+    chain: ethereum
+    data_source: graphql
+    pool_address: "https://api.morpho.org/graphql"
+    assets:
+      USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+      WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+
+  - protocol: Spark
+    slug: spark
+    type: lending
+    chain: ethereum
+    data_source: rpc
+    pool_address: "0xC13e21B648A5Ee794902342038FF3aDAB66BE987"
+    assets:
+      DAI: "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+      WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+      wstETH: "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
+
+  - protocol: Euler
+    slug: euler
+    type: lending
+    chain: ethereum
+    data_source: rest
+    pool_address: "https://v3.euler.finance/v3"
+    assets:
+      USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+      WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+
+  - protocol: Fluid
+    slug: fluid
+    type: lending
+    chain: ethereum
+    data_source: rpc
+    # ponytail: Fluid (Instadapp) vault addresses pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+      WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+
+  - protocol: Moonwell
+    slug: moonwell
+    type: lending
+    chain: base
+    data_source: rpc
+    # ponytail: Moonwell comptroller/market addresses pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      USDC: "0x0000000000000000000000000000000000000000"
+      WETH: "0x0000000000000000000000000000000000000000"
+
+  - protocol: Compound
+    slug: compound
+    type: lending
+    chain: ethereum
+    data_source: rpc
+    # ponytail: Compound v3 Comet addresses pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+      WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+
+  - protocol: Silo
+    slug: silo
+    type: lending
+    chain: ethereum
+    data_source: rpc
+    # ponytail: Silo vault addresses pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+      WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+
+  # ── Derivatives / Perpetuals ──────────────────────────────────────────────
+
+  - protocol: Hyperliquid
+    slug: hyperliquid
+    type: derivatives
+    chain: hyperliquid
+    data_source: rest
+    pool_address: "https://api.hyperliquid.xyz/info"
+    assets:
+      BTC: ""
+      ETH: ""
+      SOL: ""
+
+  - protocol: GMX
+    slug: gmx
+    type: derivatives
+    chain: arbitrum
+    data_source: rpc
+    # ponytail: GMX v2 market addresses pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      BTC: "0x0000000000000000000000000000000000000000"
+      ETH: "0x0000000000000000000000000000000000000000"
+
+  - protocol: Drift
+    slug: drift
+    type: derivatives
+    chain: solana
+    data_source: rest
+    # ponytail: Drift program/market IDs pending research
+    pool_address: ""
+    assets:
+      BTC: ""
+      ETH: ""
+      SOL: ""
+
+  - protocol: Vertex
+    slug: vertex
+    type: derivatives
+    chain: arbitrum
+    data_source: rest
+    # ponytail: Vertex endpoint pending research
+    pool_address: ""
+    assets:
+      BTC: ""
+      ETH: ""
+
+  - protocol: dYdX
+    slug: dydx
+    type: derivatives
+    chain: dydx
+    data_source: rest
+    # ponytail: dYdX v4 chain endpoint pending research
+    pool_address: ""
+    assets:
+      BTC: ""
+      ETH: ""
+
+  # ── Stable Lending Placeholders ───────────────────────────────────────────
+
+  - protocol: Stable Lending
+    slug: stable-lending
+    type: lending
+    chain: ethereum
+    data_source: rpc
+    # ponytail: placeholder for stable-rate lending products (e.g. stablecoin-specific markets)
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+      DAI: "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+
+  # ── Staking ───────────────────────────────────────────────────────────────
+
+  - protocol: Lido
+    slug: lido
+    type: staking
+    chain: ethereum
+    data_source: rpc
+    # ponytail: Lido stETH contract address pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      stETH: "0x0000000000000000000000000000000000000000"
+      ETH: "0x0000000000000000000000000000000000000000"
+
+  - protocol: Rocket Pool
+    slug: rocket-pool
+    type: staking
+    chain: ethereum
+    data_source: rpc
+    # ponytail: Rocket Pool rETH contract address pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      rETH: "0x0000000000000000000000000000000000000000"
+      ETH: "0x0000000000000000000000000000000000000000"
+
+  # ── Restaking ─────────────────────────────────────────────────────────────
+
+  - protocol: EigenLayer
+    slug: eigenlayer
+    type: restaking
+    chain: ethereum
+    data_source: rpc
+    # ponytail: EigenLayer strategy manager address pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      ETH: "0x0000000000000000000000000000000000000000"
+      stETH: "0x0000000000000000000000000000000000000000"
+
+  - protocol: ether.fi
+    slug: ether-fi
+    type: restaking
+    chain: ethereum
+    data_source: rpc
+    # ponytail: ether.fi vault addresses pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      eETH: "0x0000000000000000000000000000000000000000"
+      ETH: "0x0000000000000000000000000000000000000000"
+
+  # ── Pendle ────────────────────────────────────────────────────────────────
+
+  - protocol: Pendle
+    slug: pendle
+    type: pendle
+    chain: ethereum
+    data_source: rpc
+    # ponytail: Pendle router/market addresses pending research
+    pool_address: "0x0000000000000000000000000000000000000000"
+    assets:
+      PT: "0x0000000000000000000000000000000000000000"
+      YT: "0x0000000000000000000000000000000000000000"

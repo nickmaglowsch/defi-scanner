@@ -1,0 +1,28 @@
+{
+  "reserves_list": [
+    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+  ],
+  "reserve_data": {
+    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48": {
+      "symbol": "USDC",
+      "configuration": 7516192768,
+      "liquidityIndex": 1000000000000000000000000000,
+      "currentLiquidityRate": 50000000000000000000000000,
+      "variableBorrowIndex": 1000000000000000000000000000,
+      "currentVariableBorrowRate": 30000000000000000000000000,
+      "currentStableBorrowRate": 0,
+      "lastUpdateTimestamp": 1700000000,
+      "id": 0,
+      "aTokenAddress": "0xBcca60bB61934080951369a648Fb03DF4F96263C",
+      "stableDebtTokenAddress": "0x0000000000000000000000000000000000000001",
+      "variableDebtTokenAddress": "0x619beb58998eD2278e08620f97007e1116D5D25b",
+      "interestRateStrategyAddress": "0x0000000000000000000000000000000000000002",
+      "accruedToTreasury": 0,
+      "unbacked": 0,
+      "isolationModeTotalDebt": 0,
+      "total_supplied_raw": 5000000000000,
+      "total_borrowed_raw": 3500000000000
+    }
+  }
+}

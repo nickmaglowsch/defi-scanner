@@ -31,6 +31,7 @@ class LendingSnapshot(Base):
     )
     deposit_apy: Mapped[float | None] = mapped_column(Float, nullable=True)
     borrow_apy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reward_apy: Mapped[float | None] = mapped_column(Float, nullable=True)
     utilization: Mapped[float | None] = mapped_column(Float, nullable=True)
     available_liquidity: Mapped[float | None] = mapped_column(Float, nullable=True)
     total_supplied: Mapped[float | None] = mapped_column(Float, nullable=True)

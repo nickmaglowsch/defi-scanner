@@ -1,4 +1,4 @@
-"""Tests for history_agg.get_yield_history (TDD)."""
+"""Tests for history_agg.get_yield_history, get_percentile, get_historical_rank (TDD)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 
-from app.calculations.history_agg import get_yield_history
+from app.calculations.history_agg import get_historical_rank, get_percentile, get_yield_history
 from app.models import FundingSnapshot, LendingSnapshot, Market, Protocol
 
 
@@ -169,3 +169,102 @@ async def test_funding_snapshots_annualized_funding(db_session):
     agg = result[mid]
     assert agg["today"] == pytest.approx(15.0)
     assert agg["yesterday"] == pytest.approx(12.0)
+
+
+# ── 6. get_percentile — sufficient history ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_percentile_high(db_session):
+    """Current value is the max over 90d → percentile near 1.0 (100th)."""
+    now = _now()
+    pid = await _seed_protocol(db_session)
+    mid = await _seed_market(db_session, pid)
+
+    # Seed 25 snapshots over 60 days with values 1..25 (today = 25, the max).
+    for i in range(1, 26):
+        await _seed_lending_snapshot(
+            db_session, mid, now - timedelta(days=60 - i * 2, hours=1), float(i)
+        )
+
+    result = await get_percentile(db_session, {mid}, "lending_snapshots", "deposit_apy")
+    assert mid in result
+    # Current value (25) is the max → percentile ≈ 1.0
+    assert result[mid] == pytest.approx(1.0, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_get_percentile_low(db_session):
+    """Current value is the min over 90d → percentile near 0.0."""
+    now = _now()
+    pid = await _seed_protocol(db_session)
+    mid = await _seed_market(db_session, pid)
+
+    # Seed 25 snapshots, today has value 1 (the min).
+    for i in range(1, 26):
+        days_ago = i * 2
+        await _seed_lending_snapshot(
+            db_session, mid, now - timedelta(days=days_ago, hours=1), float(i)
+        )
+    # Add a "current" snapshot with the lowest value.
+    await _seed_lending_snapshot(db_session, mid, now - timedelta(hours=1), 0.5)
+
+    result = await get_percentile(db_session, {mid}, "lending_snapshots", "deposit_apy")
+    # 0.5 is below all historical values → percentile near 0.0
+    assert result[mid] < 0.1
+
+
+@pytest.mark.asyncio
+async def test_get_percentile_null_when_insufficient_history(db_session):
+    """Fewer than 20 points or < 7 days of history → None."""
+    now = _now()
+    pid = await _seed_protocol(db_session)
+    mid = await _seed_market(db_session, pid)
+
+    # Only 3 snapshots — insufficient
+    for i in range(3):
+        await _seed_lending_snapshot(db_session, mid, now - timedelta(hours=i + 1), float(i + 1))
+
+    result = await get_percentile(db_session, {mid}, "lending_snapshots", "deposit_apy")
+    assert result.get(mid) is None
+
+
+@pytest.mark.asyncio
+async def test_get_percentile_empty_input(db_session):
+    """Empty market_id set → empty dict."""
+    result = await get_percentile(db_session, set(), "lending_snapshots", "deposit_apy")
+    assert result == {}
+
+
+# ── 7. get_historical_rank ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_historical_rank_top(db_session):
+    """High percentile → rank string mentions '90d'."""
+    now = _now()
+    pid = await _seed_protocol(db_session)
+    mid = await _seed_market(db_session, pid)
+
+    for i in range(1, 26):
+        await _seed_lending_snapshot(
+            db_session, mid, now - timedelta(days=60 - i * 2, hours=1), float(i)
+        )
+
+    result = await get_historical_rank(db_session, {mid}, "lending_snapshots", "deposit_apy")
+    assert mid in result
+    assert result[mid] is not None
+    assert "90d" in result[mid]
+
+
+@pytest.mark.asyncio
+async def test_get_historical_rank_null_when_insufficient(db_session):
+    """< 20 points → None."""
+    now = _now()
+    pid = await _seed_protocol(db_session)
+    mid = await _seed_market(db_session, pid)
+
+    await _seed_lending_snapshot(db_session, mid, now - timedelta(hours=1), 5.0)
+
+    result = await get_historical_rank(db_session, {mid}, "lending_snapshots", "deposit_apy")
+    assert result.get(mid) is None

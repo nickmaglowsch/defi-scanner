@@ -41,7 +41,7 @@ def score_opportunities(opportunities: list[dict], weights: dict) -> list[dict]:
             else:
                 norm = (raw - min_v) / rng
 
-            if k in PENALTY_KEYS:
+            if k in PENALTY_KEYS or k.endswith("_penalty"):
                 norm = 1.0 - norm
 
             normalized[i][k] = norm

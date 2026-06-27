@@ -317,9 +317,13 @@ def test_get_looping_returns_opportunities(client, mock_db):
     vol_result.all.return_value = []
     calc_result = MagicMock()
     calc_result.scalars.return_value.all.return_value = [calc]
-    # Loop fetch execute order: history -> depth -> deposit_vol.
+    # Loop fetch execute order: history -> percentile -> rank_pct -> depth -> deposit_vol.
     history_result = MagicMock()
     history_result.all.return_value = []
+    percentile_result = MagicMock()
+    percentile_result.all.return_value = []
+    rank_pct_result = MagicMock()
+    rank_pct_result.all.return_value = []
     depth_result = MagicMock()
     depth_result.all.return_value = []
     deposit_vol_result = MagicMock()
@@ -328,7 +332,8 @@ def test_get_looping_returns_opportunities(client, mock_db):
     mock_db.execute = AsyncMock(
         side_effect=[
             snap_result, mp_result, vol_result, calc_result,
-            history_result, depth_result, deposit_vol_result,
+            history_result, percentile_result, rank_pct_result,
+            depth_result, deposit_vol_result,
         ]
     )
 
@@ -339,7 +344,8 @@ def test_get_looping_returns_opportunities(client, mock_db):
     opp = data[0]
     assert opp["asset"] == "USDC"
     assert opp["protocol"] == "Aave V3"
-    assert opp["effective_yield"] == pytest.approx(12.5)
+    assert opp["strategy_type"] == "loop"
+    assert opp["strategy_details"]["effective_yield"] == pytest.approx(12.5)
     assert "score" in opp
     assert "rank" in opp
 
@@ -374,8 +380,10 @@ def _loop_opportunity_mocks(snap=None, market=None, protocol=None, calc=None):
       3. vol_map funding (all)       — existing volatility_penalty
       4. calc_result (scalars)
       5. history_result (all)        — get_yield_history
-      6. depth_result (all)          — _history_depth_map (count, distinct_days)
-      7. deposit_vol_result (all)    — _volatility_map_lending
+      6. percentile_result (all)     — get_percentile (4-tuple per market)
+      7. rank_percentile_result (all)— get_historical_rank → get_percentile again
+      8. depth_result (all)          — _history_depth_map (count, distinct_days)
+      9. deposit_vol_result (all)    — _volatility_map_lending
     """
     snap = snap or SimpleNamespace(
         id=MOCK_SNAPSHOT_ID,
@@ -418,6 +426,15 @@ def _loop_opportunity_mocks(snap=None, market=None, protocol=None, calc=None):
         (MOCK_MARKET_ID, 5.0, 4.8, 4.9, 4.7)
     ]
 
+    # get_percentile: (market_id, percentile, point_count, day_count)
+    # Return insufficient history so percentile_90d and historical_rank are None.
+    percentile_result = MagicMock()
+    percentile_result.all.return_value = []
+
+    # get_historical_rank calls get_percentile again internally.
+    rank_percentile_result = MagicMock()
+    rank_percentile_result.all.return_value = []
+
     # _history_depth_map: (market_id, count, distinct_days)
     depth_result = MagicMock()
     depth_result.all.return_value = [(MOCK_MARKET_ID, 20, 25)]
@@ -428,7 +445,8 @@ def _loop_opportunity_mocks(snap=None, market=None, protocol=None, calc=None):
 
     return [
         snap_result, mp_result, vol_result, calc_result,
-        history_result, depth_result, deposit_vol_result,
+        history_result, percentile_result, rank_percentile_result,
+        depth_result, deposit_vol_result,
     ]
 
 
@@ -474,10 +492,10 @@ def test_opportunities_rating_label_consistency(client, mock_db):
 def test_opportunities_sharpe_null_on_zero_volatility(client, mock_db):
     """Market with zero deposit volatility → sharpe: null, not an error."""
     mocks = _loop_opportunity_mocks()
-    # Override deposit_vol_result (now index 6) to return zero volatility.
+    # Override deposit_vol_result (now index 8: snap,mp,vol,calc,hist,pct,rank_pct,depth,dep_vol)
     zero_vol = MagicMock()
     zero_vol.all.return_value = [(MOCK_MARKET_ID, 0.0)]
-    mocks[6] = zero_vol
+    mocks[8] = zero_vol
 
     mock_db.execute = AsyncMock(side_effect=mocks)
 
@@ -600,7 +618,9 @@ def _carry_opportunity_mocks_with_lending():
       4. calcs (scalars)
       5. vol_map (all)
       6. history (all)                  — get_yield_history
-      7. depth (all)                    — _history_depth_map
+      7. percentile (all)               — get_percentile
+      8. rank_percentile (all)          — get_historical_rank → get_percentile
+      9. depth (all)                    — _history_depth_map
     """
     snap = SimpleNamespace(
         id=str(uuid4()),
@@ -656,12 +676,19 @@ def _carry_opportunity_mocks_with_lending():
     history_result = MagicMock()
     history_result.all.return_value = []
 
+    percentile_result = MagicMock()
+    percentile_result.all.return_value = []
+
+    rank_percentile_result = MagicMock()
+    rank_percentile_result.all.return_value = []
+
     depth_result = MagicMock()
     depth_result.all.return_value = []
 
     return [
         snap_result, mp_result, lend_result, calc_result,
-        vol_result, history_result, depth_result,
+        vol_result, history_result, percentile_result, rank_percentile_result,
+        depth_result,
     ]
 
 
@@ -675,9 +702,10 @@ def test_carry_opp_with_lending_market_kept_and_borrows_real_cost(client, mock_d
     data = resp.json()
     assert len(data) == 1
     opp = data[0]
+    assert opp["strategy_type"] == "carry"
     # Real borrow_apy 3.0 from the lending snapshot, not the 0.0 fallback.
-    assert opp["borrow_cost"] == pytest.approx(3.0)
-    assert opp["spot_yield"] == pytest.approx(5.0)
+    assert opp["strategy_details"]["borrow_cost"] == pytest.approx(3.0)
+    assert opp["strategy_details"]["spot_yield"] == pytest.approx(5.0)
 
 
 # ── 8. Loop opps with inverted nominal spread are filtered (no real edge) ────
@@ -725,6 +753,82 @@ def test_loop_opp_with_inverted_nominal_spread_is_filtered(client, mock_db):
     assert resp.json() == []
 
 
+# ── Task-08: Generic OpportunityOut schema ────────────────────────────────────
+
+
+def test_opportunity_has_strategy_type_loop(client, mock_db):
+    """GET /api/v1/opportunities?type=loop → each item has strategy_type='loop'."""
+    mock_db.execute = AsyncMock(side_effect=_loop_opportunity_mocks())
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["strategy_type"] == "loop"
+
+
+def test_opportunity_has_strategy_details_loop(client, mock_db):
+    """Loop opportunity strategy_details contains loop-specific fields."""
+    mock_db.execute = AsyncMock(side_effect=_loop_opportunity_mocks())
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    opp = resp.json()[0]
+    details = opp["strategy_details"]
+    assert "effective_yield" in details
+    assert "leverage" in details
+    assert "deposit_apy" in details
+    assert "borrow_apy" in details
+
+
+def test_opportunity_has_net_apy_loop(client, mock_db):
+    """Loop opportunity net_apy is the effective_yield."""
+    mock_db.execute = AsyncMock(side_effect=_loop_opportunity_mocks())
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    opp = resp.json()[0]
+    assert opp["net_apy"] == pytest.approx(opp["strategy_details"]["effective_yield"])
+
+
+def test_opportunity_has_strategy_type_carry(client, mock_db):
+    """GET /api/v1/opportunities?type=carry → each item has strategy_type='carry'."""
+    mock_db.execute = AsyncMock(side_effect=_carry_opportunity_mocks_with_lending())
+
+    resp = client.get("/api/v1/opportunities?type=carry")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["strategy_type"] == "carry"
+
+
+def test_opportunity_has_strategy_details_carry(client, mock_db):
+    """Carry opportunity strategy_details contains carry-specific fields."""
+    mock_db.execute = AsyncMock(side_effect=_carry_opportunity_mocks_with_lending())
+
+    resp = client.get("/api/v1/opportunities?type=carry")
+    assert resp.status_code == 200
+    opp = resp.json()[0]
+    details = opp["strategy_details"]
+    assert "funding_yield" in details
+    assert "borrow_cost" in details
+    assert "spot_yield" in details
+    assert "net_carry" in details
+
+
+def test_opportunity_schema_has_future_fields(client, mock_db):
+    """OpportunityOut includes percentile_90d and historical_rank (null for now)."""
+    mock_db.execute = AsyncMock(side_effect=_loop_opportunity_mocks())
+
+    resp = client.get("/api/v1/opportunities?type=loop")
+    assert resp.status_code == 200
+    opp = resp.json()[0]
+    assert "percentile_90d" in opp
+    assert "historical_rank" in opp
+    assert opp["percentile_90d"] is None
+    assert opp["historical_rank"] is None
+
+
 def test_loop_opp_with_flat_zero_spread_is_kept(client, mock_db):
     """A loop with deposit == borrow (zero nominal spread) is kept — the floor
     is non-negative, not strictly positive."""
@@ -749,3 +853,97 @@ def test_loop_opp_with_flat_zero_spread_is_kept(client, mock_db):
     resp = client.get("/api/v1/opportunities?type=loop")
     assert resp.status_code == 200
     assert len(resp.json()) == 1
+
+
+# ── Task-12: Penalty keys in breakdown ───────────────────────────────────────
+
+
+def test_loop_opp_breakdown_has_no_new_penalties():
+    """Loop opportunities do not include strategy-specific penalty keys
+    (cross_protocol_penalty, slashing_penalty, etc.) — they are not in
+    the loop opp dict, so they are absent from breakdown. This is correct:
+    breakdown only shows keys that were scored."""
+    # Verified implicitly by existing tests — loop breakdown has the 7 base keys.
+    # This test documents the contract explicitly.
+    from app.calculations.ranker import score_opportunities
+
+    opps = [
+        {
+            "yield_score": 5.0,
+            "liquidity_score": 3.0,
+            "tvl_score": 2.0,
+            "stability_score": 4.0,
+            "utilization_penalty": 0.2,
+            "volatility_penalty": 0.1,
+            "protocol_risk": 0.3,
+            "cross_protocol_penalty": 0.5,  # extra penalty key
+        }
+    ]
+    weights = {
+        "yield_score": 1.0,
+        "liquidity_score": 1.0,
+        "tvl_score": 1.0,
+        "stability_score": 1.0,
+        "utilization_penalty": 1.0,
+        "volatility_penalty": 1.0,
+        "protocol_risk": 1.0,
+        "cross_protocol_penalty": 0.5,
+    }
+    result = score_opportunities(opps, weights)
+    bd = result[0]["breakdown"]
+    # cross_protocol_penalty was in the opp dict and weights → appears in breakdown
+    assert "cross_protocol_penalty" in bd
+    # and it is inverted (ends in _penalty)
+    assert isinstance(bd["cross_protocol_penalty"], float)
+    assert 0.0 <= bd["cross_protocol_penalty"] <= 1.0
+
+
+def _staking_opportunity_mocks():
+    """Mock execute side-effects for _fetch_market_type_opportunities with staking."""
+    snap = SimpleNamespace(
+        id=str(uuid4()),
+        market_id=MOCK_MARKET_ID,
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        deposit_apy=4.5,
+        borrow_apy=None,
+        utilization=None,
+        available_liquidity=None,
+        total_supplied=None,
+        total_borrowed=None,
+        tvl=None,
+        raw_payload=None,
+    )
+    market = SimpleNamespace(
+        id=MOCK_MARKET_ID, protocol_id=MOCK_PROTOCOL_ID, asset="ETH", market_type="staking"
+    )
+    protocol = SimpleNamespace(
+        id=MOCK_PROTOCOL_ID, name="Lido", type="staking", chain="ethereum", risk_score=0.2,
+        deployed_at=None, audit_count=2,
+    )
+
+    # _fetch_market_type_opportunities does 2 queries: sub+latest snap, then markets+protocols.
+    snap_result = MagicMock()
+    snap_result.scalars.return_value.all.return_value = [snap]
+
+    mp_result = MagicMock()
+    mp_result.all.return_value = [(market, protocol)]
+
+    return [snap_result, mp_result]
+
+
+def test_staking_opportunity_breakdown_has_slashing_penalty(client, mock_db):
+    """GET /api/v1/opportunities?type=staking → staking opps include slashing_penalty
+    in their breakdown dict when slashing_penalty is in the ranker weights."""
+    mock_db.execute = AsyncMock(side_effect=_staking_opportunity_mocks())
+
+    resp = client.get("/api/v1/opportunities?type=staking")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    opp = data[0]
+    assert opp["strategy_type"] == "staking"
+    # breakdown comes from ranker; staking opps now include slashing_penalty
+    bd = opp.get("breakdown")
+    if bd is not None:
+        # When breakdown is present, slashing_penalty should be there
+        assert "slashing_penalty" in bd

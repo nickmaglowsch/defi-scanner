@@ -66,55 +66,68 @@ class YieldHistoryOut(BaseModel):
     avg_30d: float | None = None
 
 
-class LoopOpportunityOut(BaseModel):
+class OpportunityOut(BaseModel):
+    """Generic opportunity schema with strategy_type discriminator.
+
+    strategy_details holds strategy-specific fields (loop leverage,
+    carry funding yield, etc.) so this schema stays stable as new
+    strategy types are added.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
+    # Common identity fields
+    strategy_type: str  # "loop" | "carry" | future types
     protocol: str
     asset: str
+    chain: str | None = None
+
+    # Common financial fields
+    net_apy: float | None = None  # effective_yield for loop, net_carry for carry
+    risk_score: float | None = None
+    score: float
+    rank: int
+
+    # Task-04 enrichment
+    market_id: str | None = None
+    breakdown: dict[str, float] | None = None
+    weights: dict[str, float] | None = None
+    rating: float | None = None
+    rating_label: str | None = None
+    confidence: float | None = None
+    medal: str | None = None
+    sharpe: float | None = None
+    history: YieldHistoryOut | None = None
+
+    # Strategy-specific details (loop leverage, carry funding yield, etc.)
+    strategy_details: dict = {}
+
+    # Task-10 future fields (anomaly context)
+    percentile_90d: float | None = None
+    historical_rank: str | None = None
+
+
+# ponytail: deprecated aliases — keep for any external code still importing them;
+# all internal code now constructs OpportunityOut directly.
+class LoopOpportunityOut(OpportunityOut):
+    """Deprecated alias for OpportunityOut with strategy_type='loop'."""
+
     deposit_apy: float | None = None
     borrow_apy: float | None = None
     effective_yield: float | None = None
     leverage: float | None = None
     safety_margin: float | None = None
     liquidation_distance: float | None = None
-    risk_score: float | None = None
-    score: float
-    rank: int
-    # Task-04 enrichment fields
-    market_id: str | None = None
-    breakdown: dict[str, float] | None = None
-    weights: dict[str, float] | None = None
-    rating: float | None = None
-    rating_label: str | None = None
-    confidence: float | None = None
-    medal: str | None = None
-    sharpe: float | None = None
-    history: YieldHistoryOut | None = None
 
 
-class CarryOpportunityOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class CarryOpportunityOut(OpportunityOut):
+    """Deprecated alias for OpportunityOut with strategy_type='carry'."""
 
-    protocol: str
-    asset: str
     funding_yield: float | None = None
     spot_yield: float | None = None
     borrow_cost: float | None = None
     trading_fees: float | None = None
     net_carry: float | None = None
-    risk_score: float | None = None
-    score: float
-    rank: int
-    # Task-04 enrichment fields
-    market_id: str | None = None
-    breakdown: dict[str, float] | None = None
-    weights: dict[str, float] | None = None
-    rating: float | None = None
-    rating_label: str | None = None
-    confidence: float | None = None
-    medal: str | None = None
-    sharpe: float | None = None
-    history: YieldHistoryOut | None = None
 
 
 class HistoryPointOut(BaseModel):

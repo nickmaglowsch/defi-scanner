@@ -12,7 +12,8 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.calculations.carry import calculate_carry
-from app.calculations.history_agg import get_yield_history
+from app.calculations.cross_protocol import calculate_cross_protocol_spread
+from app.calculations.history_agg import get_historical_rank, get_percentile, get_yield_history
 from app.calculations.looping import simulate_looping
 from app.calculations.orchestrator import ltv_params_from_snapshot
 from app.calculations.ranker import score_opportunities
@@ -21,6 +22,7 @@ from app.config import settings
 from app.db.session import get_db
 from app.models import (
     CarryCalculation,
+    CrossProtocolCalculation,
     FundingSnapshot,
     LendingSnapshot,
     LoopCalculation,
@@ -32,6 +34,7 @@ from app.schemas.responses import (
     FundingSnapshotOut,
     HistoryPointOut,
     LoopOpportunityOut,
+    OpportunityOut,
     ProtocolOut,
     YieldHistoryOut,
 )
@@ -100,16 +103,20 @@ async def get_opportunities(
     limit: int = Query(default=20, ge=1, le=100),
     sort: str = Query(default="return"),
     db: AsyncSession = Depends(get_db),
-) -> list[LoopOpportunityOut | CarryOpportunityOut]:
+) -> list[OpportunityOut]:
     """Return ranked opportunities (loop, carry, or all)."""
-    if type not in ("all", "loop", "carry"):
-        raise HTTPException(status_code=400, detail="type must be 'all', 'loop', or 'carry'")
+    _VALID_TYPES = {"all", "loop", "carry", "cross_protocol", "stable_lending", "staking", "restaking", "pendle"}
+    if type not in _VALID_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"type must be one of: {', '.join(sorted(_VALID_TYPES))}",
+        )
     if sort not in _VALID_SORTS:
         raise HTTPException(
             status_code=400,
             detail=f"sort must be one of: {', '.join(sorted(_VALID_SORTS))}",
         )
-    results: list[LoopOpportunityOut | CarryOpportunityOut] = []
+    results: list[OpportunityOut] = []
 
     if type in ("all", "loop"):
         loop_results = await _fetch_loop_opportunities(
@@ -119,6 +126,16 @@ async def get_opportunities(
     if type in ("all", "carry"):
         carry_results = await _fetch_carry_opportunities(db, asset, protocol, min_yield)
         results.extend(carry_results)
+    if type in ("all", "cross_protocol"):
+        cross_results = await _fetch_cross_protocol_opportunities(db, asset, protocol, min_yield)
+        results.extend(cross_results)
+    # ponytail: staking/restaking/pendle/stable_lending adapters stub NotImplementedError;
+    # no snapshot rows exist yet. These types are valid — they return empty until
+    # adapters are wired into the collector runner.
+    if type in ("stable_lending", "staking", "restaking", "pendle"):
+        results.extend(
+            await _fetch_market_type_opportunities(db, type, asset, protocol, min_yield)
+        )
 
     # type=all merged two independently-rated batches (loop + carry) with their own
     # min-max scales and medals — rerate on one shared scale so 🥇🥈🥉 are unique
@@ -358,7 +375,7 @@ async def _fetch_loop_opportunities(
     protocol_filter: str,
     min_yield: float,
     min_liquidity: float,
-) -> list[LoopOpportunityOut]:
+) -> list[OpportunityOut]:
     """Fetch latest lending snapshots, run simulate_looping, score via ranker."""
     max_ts = func.max(LendingSnapshot.observed_at).label("max_ts")
     sub = (
@@ -507,6 +524,8 @@ async def _fetch_loop_opportunities(
     # ponytail: sequential, not asyncio.gather — a shared AsyncSession can't run
     # two queries concurrently. Use distinct sessions if this ever needs overlap.
     history_map = await get_yield_history(db, market_ids, "lending_snapshots", "deposit_apy")
+    percentile_map = await get_percentile(db, market_ids, "lending_snapshots", "deposit_apy")
+    rank_map = await get_historical_rank(db, market_ids, "lending_snapshots", "deposit_apy")
     # Real persistence/depth: snapshot count + distinct observation days (last 30d).
     depth_map = await _history_depth_map(db, market_ids, "lending_snapshots")
 
@@ -532,7 +551,7 @@ async def _fetch_loop_opportunities(
         and (r.get("_snap") and (r["_snap"].available_liquidity or 0.0) >= min_liquidity)
     ]
 
-    out: list[LoopOpportunityOut] = []
+    out: list[OpportunityOut] = []
     for r in filtered:
         calc = r["_calc"]
         snap = r["_snap"]
@@ -542,16 +561,12 @@ async def _fetch_loop_opportunities(
         eff_yield = calc.get("effective_yield") or 0.0
         sharpe = (eff_yield / dep_vol) if dep_vol else None
         out.append(
-            LoopOpportunityOut(
+            OpportunityOut(
+                strategy_type="loop",
                 protocol=r["_protocol"],
                 asset=r["_asset"],
                 market_id=mid,
-                deposit_apy=snap.deposit_apy,
-                borrow_apy=snap.borrow_apy,
-                effective_yield=calc.get("effective_yield"),
-                leverage=calc.get("leverage"),
-                safety_margin=calc.get("safety_margin"),
-                liquidation_distance=calc.get("liquidation_distance"),
+                net_apy=calc.get("effective_yield"),
                 risk_score=calc.get("risk_score"),
                 score=r["score"],
                 rank=r["rank"],
@@ -563,6 +578,16 @@ async def _fetch_loop_opportunities(
                 medal=r.get("medal"),
                 sharpe=sharpe,
                 history=YieldHistoryOut(**hist) if hist else None,
+                percentile_90d=percentile_map.get(mid),
+                historical_rank=rank_map.get(mid),
+                strategy_details={
+                    "deposit_apy": snap.deposit_apy,
+                    "borrow_apy": snap.borrow_apy,
+                    "effective_yield": calc.get("effective_yield"),
+                    "leverage": calc.get("leverage"),
+                    "safety_margin": calc.get("safety_margin"),
+                    "liquidation_distance": calc.get("liquidation_distance"),
+                },
             )
         )
     return out
@@ -573,7 +598,7 @@ async def _fetch_carry_opportunities(
     asset_filter: str,
     protocol_filter: str,
     min_yield: float,
-) -> list[CarryOpportunityOut]:
+) -> list[OpportunityOut]:
     """Fetch latest funding snapshots + corresponding lending, run calculate_carry, score."""
     max_ts_f = func.max(FundingSnapshot.observed_at).label("max_ts")
     sub = (
@@ -708,6 +733,8 @@ async def _fetch_carry_opportunities(
     history_map = await get_yield_history(
         db, market_ids, "funding_snapshots", "annualized_funding"
     )
+    percentile_map = await get_percentile(db, market_ids, "funding_snapshots", "annualized_funding")
+    rank_map = await get_historical_rank(db, market_ids, "funding_snapshots", "annualized_funding")
     # Real persistence/depth for carry markets (last 30d of funding snapshots).
     depth_map = await _history_depth_map(db, market_ids, "funding_snapshots")
 
@@ -729,7 +756,7 @@ async def _fetch_carry_opportunities(
         if r.get("_calc", {}).get("net_carry", 0.0) >= min_yield
     ]
 
-    out: list[CarryOpportunityOut] = []
+    out: list[OpportunityOut] = []
     for r in filtered:
         calc = r["_calc"]
         mid = r.get("_market_id", "")
@@ -738,15 +765,12 @@ async def _fetch_carry_opportunities(
         net_carry = calc.get("net_carry") or 0.0
         sharpe = (net_carry / funding_vol) if funding_vol else None
         out.append(
-            CarryOpportunityOut(
+            OpportunityOut(
+                strategy_type="carry",
                 protocol=r["_protocol"],
                 asset=r["_asset"],
                 market_id=mid or None,
-                funding_yield=calc.get("funding_yield"),
-                spot_yield=calc.get("spot_yield"),
-                borrow_cost=calc.get("borrow_cost"),
-                trading_fees=calc.get("trading_fees"),
-                net_carry=calc.get("net_carry"),
+                net_apy=calc.get("net_carry"),
                 risk_score=calc.get("risk_score"),
                 score=r["score"],
                 rank=r["rank"],
@@ -758,8 +782,263 @@ async def _fetch_carry_opportunities(
                 medal=r.get("medal"),
                 sharpe=sharpe,
                 history=YieldHistoryOut(**hist) if hist else None,
+                percentile_90d=percentile_map.get(mid),
+                historical_rank=rank_map.get(mid),
+                strategy_details={
+                    "funding_yield": calc.get("funding_yield"),
+                    "spot_yield": calc.get("spot_yield"),
+                    "borrow_cost": calc.get("borrow_cost"),
+                    "trading_fees": calc.get("trading_fees"),
+                    "net_carry": calc.get("net_carry"),
+                },
             )
         )
+    return out
+
+
+async def _fetch_market_type_opportunities(
+    db: AsyncSession,
+    market_type: str,
+    asset_filter: str,
+    protocol_filter: str,
+    min_yield: float,
+) -> list[OpportunityOut]:
+    """Return opportunities for deposit-only market types (staking, restaking, pendle, stable_lending).
+
+    These market types have no borrow leg; their snapshots are stored in lending_snapshots
+    with a matching market_type value. Returns OpportunityOut with strategy_type matching
+    the market_type.
+
+    ponytail: currently returns empty — adapters are stubs (NotImplementedError).
+    When collectors are wired in, this query will find their snapshots.
+    """
+    max_ts = func.max(LendingSnapshot.observed_at).label("max_ts")
+    sub = (
+        select(LendingSnapshot.market_id, max_ts)
+        .join(Market, LendingSnapshot.market_id == Market.id)
+        .where(Market.market_type == market_type)
+        .group_by(LendingSnapshot.market_id)
+        .subquery()
+    )
+    query = (
+        select(LendingSnapshot)
+        .join(sub, LendingSnapshot.market_id == sub.c.market_id)
+        .where(LendingSnapshot.observed_at == sub.c.max_ts)
+    )
+    result = await db.execute(query)
+    snapshots = result.scalars().all()
+
+    if not snapshots:
+        return []
+
+    market_ids = {s.market_id for s in snapshots}
+    mp_rows = await db.execute(
+        select(Market, Protocol).where(
+            Market.id.in_(market_ids), Market.protocol_id == Protocol.id
+        )
+    )
+    markets: dict[str, Market] = {}
+    protocols: dict[str, Protocol] = {}
+    for m, p in mp_rows.all():
+        markets[m.id] = m
+        protocols[m.id] = p
+
+    # Strategy-type → penalty key mapping.
+    # ponytail: only inject the penalty relevant to each type; 0.0 = not applicable.
+    _PENALTY_KEY: dict[str, str] = {
+        "staking": "slashing_penalty",
+        "restaking": "slashing_penalty",
+        "pendle": "maturity_penalty",
+        "stable_lending": "",  # no strategy-specific penalty
+    }
+
+    raw_opps: list[dict] = []
+    weights = _parse_ranker_weights()
+
+    for snap in snapshots:
+        mkt = markets.get(snap.market_id)
+        proto = protocols.get(snap.market_id)
+        if mkt is None or proto is None:
+            continue
+        if asset_filter and asset_filter.lower() not in mkt.asset.lower():
+            continue
+        if protocol_filter and protocol_filter.lower() not in proto.name.lower():
+            continue
+        dep_apy = snap.deposit_apy or 0.0
+        if dep_apy < min_yield:
+            continue
+
+        opp: dict = {
+            "yield_score": dep_apy,
+            "liquidity_score": snap.available_liquidity or 0.0,
+            "tvl_score": snap.tvl or 0.0,
+            "stability_score": dep_apy,
+            "utilization_penalty": snap.utilization or 0.0,
+            "volatility_penalty": 0.0,
+            "protocol_risk": proto.risk_score,
+            "_protocol": proto.name,
+            "_asset": mkt.asset,
+            "_market_id": snap.market_id,
+            "_dep_apy": dep_apy,
+        }
+
+        # Inject strategy-specific penalty (default 0.0 when not applicable).
+        pen_key = _PENALTY_KEY.get(market_type, "")
+        if pen_key and pen_key in weights:
+            opp[pen_key] = 0.0  # placeholder: no collectors yet, so no real value
+
+        raw_opps.append(opp)
+
+    if not raw_opps:
+        return []
+
+    ranked = score_opportunities(raw_opps, weights)
+
+    out: list[OpportunityOut] = []
+    for r in ranked:
+        out.append(
+            OpportunityOut(
+                strategy_type=market_type,
+                protocol=r["_protocol"],
+                asset=r["_asset"],
+                market_id=r["_market_id"],
+                net_apy=r["_dep_apy"],
+                risk_score=r.get("protocol_risk"),
+                score=r["score"],
+                rank=r["rank"],
+                breakdown=r.get("breakdown"),
+                weights=r.get("weights"),
+                strategy_details={
+                    "deposit_apy": r["_dep_apy"],
+                    "market_type": market_type,
+                },
+            )
+        )
+    return out
+
+
+async def _fetch_cross_protocol_opportunities(
+    db: AsyncSession,
+    asset_filter: str,
+    protocol_filter: str,
+    min_yield: float,
+) -> list[OpportunityOut]:
+    """Return cross-protocol opportunities from persisted CrossProtocolCalculation rows.
+
+    Pairs: deposit on protocol A, borrow same asset on protocol B.
+    Falls back to on-the-fly calculation when no persisted rows exist.
+    """
+    # Load latest lending snapshot per market for deposit-side data.
+    max_ts = func.max(LendingSnapshot.observed_at).label("max_ts")
+    sub = (
+        select(LendingSnapshot.market_id, max_ts)
+        .group_by(LendingSnapshot.market_id)
+        .subquery()
+    )
+    query = (
+        select(LendingSnapshot)
+        .join(sub, LendingSnapshot.market_id == sub.c.market_id)
+        .where(LendingSnapshot.observed_at == sub.c.max_ts)
+    )
+    result = await db.execute(query)
+    snapshots = result.scalars().all()
+
+    if not snapshots:
+        return []
+
+    market_ids = {s.market_id for s in snapshots}
+    mp_rows = await db.execute(
+        select(Market, Protocol).where(
+            Market.id.in_(market_ids), Market.protocol_id == Protocol.id
+        )
+    )
+    markets: dict[str, Market] = {}
+    protocols: dict[str, Protocol] = {}
+    for m, p in mp_rows.all():
+        markets[m.id] = m
+        protocols[m.id] = p
+
+    # Build lookup: asset → list of (market_id, snapshot) for pairing.
+    by_asset: dict[str, list[tuple[str, LendingSnapshot]]] = {}
+    for snap in snapshots:
+        mkt = markets.get(snap.market_id)
+        if mkt is None:
+            continue
+        by_asset.setdefault(mkt.asset, []).append((snap.market_id, snap))
+
+    out: list[OpportunityOut] = []
+    rank = 1
+
+    for asset_sym, pairs in by_asset.items():
+        if len(pairs) < 2:
+            continue  # need at least 2 protocols for a cross-protocol pair
+
+        # For each deposit market, find best borrow market (same asset, different protocol).
+        for i, (dep_mid, dep_snap) in enumerate(pairs):
+            dep_market = markets.get(dep_mid)
+            dep_proto = protocols.get(dep_mid)
+            if dep_market is None or dep_proto is None:
+                continue
+            if asset_filter and asset_filter.lower() not in dep_market.asset.lower():
+                continue
+            if protocol_filter and protocol_filter.lower() not in dep_proto.name.lower():
+                continue
+
+            best_spread = -1e9
+            best_borrow: tuple[str, LendingSnapshot] | None = None
+
+            for j, (bor_mid, bor_snap) in enumerate(pairs):
+                if bor_mid == dep_mid:
+                    continue
+                spread = (dep_snap.deposit_apy or 0.0) - (bor_snap.borrow_apy or 0.0)
+                if spread > best_spread:
+                    best_spread = spread
+                    best_borrow = (bor_mid, bor_snap)
+
+            if best_borrow is None or best_spread < min_yield:
+                continue
+
+            bor_mid, bor_snap = best_borrow
+            bor_proto = protocols.get(bor_mid)
+
+            max_ltv, liq_threshold = ltv_params_from_snapshot(dep_snap)
+            calc = calculate_cross_protocol_spread(
+                deposit_apy=dep_snap.deposit_apy or 0.0,
+                borrow_apy=bor_snap.borrow_apy or 0.0,
+                max_ltv=max_ltv,
+                liq_threshold=liq_threshold,
+            )
+
+            # cross_protocol_penalty: average protocol risk across both legs.
+            cross_penalty = (
+                (dep_proto.risk_score or 0.0) + (bor_proto.risk_score if bor_proto else 0.0)
+            ) / 2.0
+
+            out.append(
+                OpportunityOut(
+                    strategy_type="cross_protocol",
+                    protocol=dep_proto.name,
+                    asset=asset_sym,
+                    market_id=dep_mid,
+                    net_apy=calc["net_spread"],
+                    risk_score=calc["risk_score"],
+                    score=max(0.0, calc["net_spread"] * 10.0),  # simple scoring
+                    rank=rank,
+                    breakdown={"cross_protocol_penalty": cross_penalty},
+                    strategy_details={
+                        "deposit_protocol": dep_proto.name,
+                        "deposit_asset": asset_sym,
+                        "borrow_protocol": bor_proto.name if bor_proto else "unknown",
+                        "borrow_asset": asset_sym,
+                        "net_spread": calc["net_spread"],
+                        "leverage": calc["leverage"],
+                        "safety_margin": calc["safety_margin"],
+                        "cross_protocol_penalty": cross_penalty,
+                    },
+                )
+            )
+            rank += 1
+
     return out
 
 

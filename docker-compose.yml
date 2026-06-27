@@ -26,6 +26,11 @@ services:
     environment:
       DEFI_DATABASE_URL: postgresql+asyncpg://defi:defi@timescaledb:5432/defi_scanner
       DEFI_RPC_URL: ${DEFI_RPC_URL}
+      # Per-chain RPC overrides — fall back to DEFI_RPC_URL when not set.
+      DEFI_RPC_URL_BASE: ${DEFI_RPC_URL_BASE:-}
+      DEFI_RPC_URL_ARBITRUM: ${DEFI_RPC_URL_ARBITRUM:-}
+      DEFI_RPC_URL_OPTIMISM: ${DEFI_RPC_URL_OPTIMISM:-}
+      DEFI_RPC_URL_POLYGON: ${DEFI_RPC_URL_POLYGON:-}
       DEFI_COLLECTOR_INTERVAL_SECONDS: ${DEFI_COLLECTOR_INTERVAL_SECONDS:-60}
       DEFI_ALERT_INTERVAL_SECONDS: ${DEFI_ALERT_INTERVAL_SECONDS:-60}
     restart: unless-stopped

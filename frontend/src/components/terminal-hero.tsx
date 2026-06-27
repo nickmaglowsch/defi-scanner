@@ -2,19 +2,27 @@
 
 import { useOpportunities } from "@/lib/opportunities-context";
 import {
-  isLoop,
   oppYield,
-  type LoopOpportunityOut,
-  type CarryOpportunityOut,
+  type OpportunityOut,
 } from "@/lib/api";
 import { riskLevel, type RiskLevel } from "@/components/opportunity-card";
 import { fmtPct } from "@/lib/utils";
 
-type AnyOpp = LoopOpportunityOut | CarryOpportunityOut;
+type AnyOpp = OpportunityOut;
+
+const STRATEGY_LABEL: Record<string, string> = {
+  loop: "Loop",
+  carry: "Carry",
+  stable_lending: "Stable Lend",
+  staking: "Staking",
+  restaking: "Restaking",
+  pendle: "Pendle",
+  cross_protocol: "Cross-Protocol",
+};
 
 function getStrategy(opp: AnyOpp): string {
-  const kind = isLoop(opp) ? "Loop" : "Carry";
-  return `${kind} ${opp.asset}`;
+  const label = STRATEGY_LABEL[opp.strategy_type] ?? opp.strategy_type;
+  return `${label} ${opp.asset}`;
 }
 
 function isShortLived(opp: AnyOpp): boolean {
@@ -39,7 +47,7 @@ function riskDot(opp: AnyOpp): { dot: string; colorClass: string } {
 }
 
 export type TerminalHeroProps = {
-  onOpenDetail?: (opp: LoopOpportunityOut | CarryOpportunityOut) => void;
+  onOpenDetail?: (opp: AnyOpp) => void;
 };
 
 export default function TerminalHero({ onOpenDetail }: TerminalHeroProps) {

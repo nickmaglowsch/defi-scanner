@@ -12,7 +12,7 @@ import {
 } from "recharts";
 import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { getHistory, HistoryPointOut, LoopOpportunityOut, CarryOpportunityOut } from "@/lib/api";
+import { getHistory, HistoryPointOut, OpportunityOut } from "@/lib/api";
 import { protocolLink } from "@/lib/protocol-links";
 import { getRiskLabel, getRiskColor } from "@/components/opportunity-card";
 import { fmtPct } from "@/lib/utils";
@@ -89,14 +89,22 @@ function spreadSeries(deposits: HistoryPointOut[], borrows: HistoryPointOut[]) {
 // ── Main component ─────────────────────────────────────────────────────────
 
 export type OpportunityDetailProps = {
-  opp: LoopOpportunityOut | CarryOpportunityOut;
+  opp: OpportunityOut;
   onClose: () => void;
 };
 
 export default function OpportunityDetail({ opp, onClose }: OpportunityDetailProps) {
-  const isLoop = "effective_yield" in opp;
-  const loop = isLoop ? (opp as LoopOpportunityOut) : null;
-  const carry = !isLoop ? (opp as CarryOpportunityOut) : null;
+  const isLoop = opp.strategy_type === "loop";
+  const isCarry = opp.strategy_type === "carry";
+  // ponytail: strategy_details is a dict — access by key with null fallback
+  const d = opp.strategy_details ?? {};
+
+  const STRATEGY_NAME: Record<string, string> = {
+    loop: "Loop", carry: "Carry", stable_lending: "Stable Lending",
+    staking: "Staking", restaking: "Restaking", pendle: "Pendle",
+    cross_protocol: "Cross-Protocol",
+  };
+  const strategyName = STRATEGY_NAME[opp.strategy_type] ?? opp.strategy_type;
 
   const link = protocolLink(opp.protocol);
 
@@ -105,6 +113,7 @@ export default function OpportunityDetail({ opp, onClose }: OpportunityDetailPro
   const [yieldChart, setYieldChart] = useState<ChartStatus>({ loading: true, error: null, data: [] });
   const [borrowChart, setBorrowChart] = useState<ChartStatus>(isLoop ? { loading: true, error: null, data: [] } : empty);
   const [spreadChart, setSpreadChart] = useState<ChartStatus>(isLoop ? { loading: true, error: null, data: [] } : empty);
+  // ponytail: for non-loop/carry types, we only show the yield chart
 
   const marketId = opp.market_id ?? null;
 
@@ -138,15 +147,15 @@ export default function OpportunityDetail({ opp, onClose }: OpportunityDetailPro
         setBorrowChart({ loading: false, error: null, data: toChartData(borrowPts) });
         setSpreadChart({ loading: false, error: null, data: spreadSeries(depositPts, borrowPts) });
       });
-    } else {
-      // Carry: only yield chart
+    } else if (isCarry) {
       getHistory({ type: "funding", market_id: marketId, field: "annualized_funding", limit: 100 })
         .then((pts) => setYieldChart({ loading: false, error: null, data: toChartData(pts) }))
         .catch((e: Error) => setYieldChart({ loading: false, error: e.message, data: [] }));
+    } else {
+      // Other strategy types: no chart data available yet
+      setYieldChart({ loading: false, error: null, data: [] });
     }
-  // ponytail: opp identity covers all derived fields; exhaustive deps would retrigger on every render
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [marketId, isLoop]);
+  }, [marketId, isLoop, isCarry]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -154,7 +163,7 @@ export default function OpportunityDetail({ opp, onClose }: OpportunityDetailPro
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 className="text-xl font-bold">
-            {isLoop ? "Loop" : "Carry"} / {opp.protocol} / {opp.asset}
+            {strategyName} / {opp.protocol} / {opp.asset}
           </h2>
           <div className={`mt-1 text-sm font-medium ${getRiskColor(opp.risk_score)}`}>
             {getRiskLabel(opp.risk_score)} risk
@@ -177,54 +186,61 @@ export default function OpportunityDetail({ opp, onClose }: OpportunityDetailPro
 
       {/* ── Metrics ── */}
       <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-3">
-        {isLoop && loop && (
+        {isLoop && (
           <>
             <div>
               <div className="text-xs text-muted-foreground">Deposit APY</div>
-              <div className="font-medium">{fmtPct(loop.deposit_apy)}</div>
+              <div className="font-medium">{fmtPct(d.deposit_apy)}</div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Borrow APY</div>
-              <div className="font-medium">{fmtPct(loop.borrow_apy)}</div>
+              <div className="font-medium">{fmtPct(d.borrow_apy)}</div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Effective Yield</div>
-              <div className="font-medium">{fmtPct(loop.effective_yield)}</div>
+              <div className="font-medium">{fmtPct(d.effective_yield)}</div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Leverage</div>
-              <div className="font-medium">{loop.leverage != null ? loop.leverage.toFixed(2) + "x" : "—"}</div>
+              <div className="font-medium">{d.leverage != null ? Number(d.leverage).toFixed(2) + "x" : "—"}</div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Safety Margin</div>
               <div className="font-medium">
-                {loop.safety_margin != null ? (loop.safety_margin * 100).toFixed(1) + "%" : "—"}
+                {d.safety_margin != null ? (Number(d.safety_margin) * 100).toFixed(1) + "%" : "—"}
               </div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Liq. Distance</div>
               <div className="font-medium">
-                {loop.liquidation_distance != null ? (loop.liquidation_distance * 100).toFixed(1) + "%" : "—"}
+                {d.liquidation_distance != null ? (Number(d.liquidation_distance) * 100).toFixed(1) + "%" : "—"}
               </div>
             </div>
           </>
         )}
-        {!isLoop && carry && (
+        {isCarry && (
           <>
             <div>
               <div className="text-xs text-muted-foreground">Funding Yield</div>
-              <div className="font-medium">{fmtPct(carry.funding_yield)}</div>
+              <div className="font-medium">{fmtPct(d.funding_yield)}</div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Net Carry</div>
-              <div className="font-medium">{fmtPct(carry.net_carry)}</div>
+              <div className="font-medium">{fmtPct(d.net_carry)}</div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Borrow Cost</div>
-              <div className="font-medium">{fmtPct(carry.borrow_cost)}</div>
+              <div className="font-medium">{fmtPct(d.borrow_cost)}</div>
             </div>
           </>
         )}
+        {/* Generic details for non-loop, non-carry strategy types */}
+        {!isLoop && !isCarry && Object.entries(d).map(([key, val]) => (
+          <div key={key}>
+            <div className="text-xs text-muted-foreground capitalize">{key.replace(/_/g, " ")}</div>
+            <div className="font-medium">{val != null ? fmtPct(val) : "—"}</div>
+          </div>
+        ))}
         <div>
           <div className="text-xs text-muted-foreground">Risk Score</div>
           <div className="font-medium">{opp.risk_score != null ? opp.risk_score.toFixed(2) : "—"}</div>

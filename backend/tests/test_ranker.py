@@ -274,3 +274,38 @@ def test_existing_behavior_intact_with_breakdown():
         assert "rank" in item
         assert "breakdown" in item
         assert "weights" in item
+
+
+# ── 15. Custom _penalty key is inverted (TDD task-12) ────────────────────────
+
+
+def test_custom_penalty_key_suffix_is_inverted():
+    """Any key ending in _penalty is treated as a penalty (inverted normalization).
+
+    High raw foo_penalty → low normalized contribution.
+    """
+    weights = {**_DEFAULT_WEIGHTS, "foo_penalty": 1.0}
+    opps = [
+        {**_opp(), "foo_penalty": 0.1},  # low penalty → should score higher
+        {**_opp(), "foo_penalty": 0.9},  # high penalty → should score lower
+    ]
+    result = score_opportunities(opps, weights)
+
+    low_pen = next(r for r in result if r["foo_penalty"] == 0.1)
+    high_pen = next(r for r in result if r["foo_penalty"] == 0.9)
+
+    # Inversion: lower raw penalty → higher breakdown value → higher score
+    assert low_pen["breakdown"]["foo_penalty"] > high_pen["breakdown"]["foo_penalty"]
+    assert low_pen["score"] > high_pen["score"]
+    assert low_pen["rank"] == 1
+
+
+def test_penalty_suffix_detection_does_not_affect_non_penalty_keys():
+    """Keys not ending in _penalty are NOT inverted."""
+    weights = {"yield_score": 1.0, "foo_penalty": 0.0}  # penalty weight=0, only yield counts
+    opps = [
+        {"yield_score": 10.0, "foo_penalty": 0.5},
+        {"yield_score": 1.0, "foo_penalty": 0.5},
+    ]
+    result = score_opportunities(opps, weights)
+    assert result[0]["yield_score"] == 10.0  # higher yield still wins

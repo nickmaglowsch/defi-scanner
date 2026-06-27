@@ -10,6 +10,8 @@ from typing import Any
 from web3 import Web3
 from web3.contract import Contract
 
+from app.protocols.registry import RegistryEntry
+
 logger = logging.getLogger("defi_scanner")
 
 RAY = 10**27
@@ -116,20 +118,26 @@ def _parse_config_data(config_data: int) -> dict[str, float]:
 
 
 class AaveV3Adapter:
-    """Reads Aave V3 lending reserve data from Ethereum mainnet."""
+    """Reads Aave V3 lending reserve data for a registry entry."""
 
     def __init__(
         self,
+        registry_entry: RegistryEntry,
         rpc_url: str,
-        pool_address: str,
-        assets: dict[str, str],
+        client: Web3 | None = None,
     ) -> None:
-        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
-        self.pool_address = Web3.to_checksum_address(pool_address)
+        self.registry_entry = registry_entry
+        self.chain = registry_entry.chain
+        self.protocol = registry_entry.protocol
+        self.w3 = client if client is not None else Web3(Web3.HTTPProvider(rpc_url))
+        if not registry_entry.pool_address:
+            raise ValueError("registry_entry.pool_address is required")
+        self.pool_address = Web3.to_checksum_address(registry_entry.pool_address)
         self.pool: Contract = self.w3.eth.contract(address=self.pool_address, abi=_AAVE_POOL_ABI)
         # {symbol: checksummed_address}
         self.assets: dict[str, str] = {
-            sym: Web3.to_checksum_address(addr) for sym, addr in assets.items()
+            sym: Web3.to_checksum_address(addr)
+            for sym, addr in (registry_entry.assets or {}).items()
         }
 
     def _get_erc20_contract(self, address: str) -> Contract:
@@ -250,6 +258,10 @@ class AaveV3Adapter:
         }
 
         return {
+            "chain": self.chain,
+            "protocol": self.protocol,
+            "market_type": "lending",
+            "reward_apy": None,
             "asset": symbol,
             "deposit_apy": deposit_apy,
             "borrow_apy": borrow_apy,

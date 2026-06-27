@@ -13,13 +13,11 @@ import {
   getOpportunities,
   getAssets,
   getProtocols,
-  isLoop,
-  type LoopOpportunityOut,
-  type CarryOpportunityOut,
+  type OpportunityOut,
 } from "@/lib/api";
 import { useOpportunities } from "@/lib/opportunities-context";
 
-type AnyOpp = LoopOpportunityOut | CarryOpportunityOut;
+type AnyOpp = OpportunityOut;
 
 const SORT_OPTIONS = [
   { value: "return", label: "Expected Return" },
@@ -108,6 +106,11 @@ export default function OpportunityFeed({
               <SelectItem value="all">All Types</SelectItem>
               <SelectItem value="loop">Loop</SelectItem>
               <SelectItem value="carry">Carry</SelectItem>
+              <SelectItem value="stable_lending">Stable Lending</SelectItem>
+              <SelectItem value="staking">Staking</SelectItem>
+              <SelectItem value="restaking">Restaking</SelectItem>
+              <SelectItem value="pendle">Pendle</SelectItem>
+              <SelectItem value="cross_protocol">Cross-Protocol</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -189,7 +192,6 @@ export default function OpportunityFeed({
             <OpportunityCard
               key={`${opp.protocol}-${opp.asset}-${i}`}
               opportunity={opp}
-              kind={isLoop(opp) ? "loop" : "carry"}
               onOpenDetail={onOpenDetail}
             />
           ))}

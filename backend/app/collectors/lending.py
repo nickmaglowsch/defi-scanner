@@ -36,10 +36,9 @@ class LendingCollector:
 
         async with self._session_factory() as session:
             try:
-                protocol = await self._upsert_protocol(session)
                 snapshots: list[LendingSnapshot] = []
                 for r in reserves:
-                    snap = await self._process_reserve(session, protocol.id, r)
+                    snap = await self._process_reserve(session, r)
                     snapshots.append(snap)
                 await session.commit()
 
@@ -61,7 +60,9 @@ class LendingCollector:
                 logger.exception("Failed to persist lending snapshots")
                 raise
 
-    async def _upsert_protocol(self, session: AsyncSession) -> Protocol:
+    async def _upsert_protocol(
+        self, session: AsyncSession, chain: str | None = None
+    ) -> Protocol:
         """Ensure a Protocol row exists for this collector's protocol.
 
         Uses SELECT-then-INSERT to avoid unique-violation exceptions
@@ -72,19 +73,25 @@ class LendingCollector:
         )
         existing = result.scalar_one_or_none()
         if existing is not None:
+            if chain and existing.chain is None:
+                existing.chain = chain
             return existing
 
         protocol = Protocol(
             name=self._protocol_name,
             type="lending",
-            chain="ethereum",
+            chain=chain,
         )
         session.add(protocol)
         await session.flush()  # generate id before using it
         return protocol
 
     async def _upsert_market(
-        self, session: AsyncSession, protocol_id: str, asset: str
+        self,
+        session: AsyncSession,
+        protocol_id: str,
+        asset: str,
+        chain: str | None = None,
     ) -> Market:
         """Ensure a Market row exists for (protocol, asset, lending)."""
         result = await session.execute(
@@ -96,29 +103,35 @@ class LendingCollector:
         )
         existing = result.scalar_one_or_none()
         if existing is not None:
+            if chain and existing.chain is None:
+                existing.chain = chain
             return existing
 
         market = Market(
             protocol_id=protocol_id,
             asset=asset,
             market_type="lending",
+            chain=chain,
         )
         session.add(market)
         await session.flush()
         return market
 
     async def _process_reserve(
-        self, session: AsyncSession, protocol_id: str, reserve: dict[str, object]
+        self, session: AsyncSession, reserve: dict[str, object]
     ) -> LendingSnapshot:
         """Insert a LendingSnapshot for a single reserve dict. Returns the snapshot."""
         asset = str(reserve["asset"])
-        market = await self._upsert_market(session, protocol_id, asset)
+        chain = reserve.get("chain")
+        protocol = await self._upsert_protocol(session, chain)
+        market = await self._upsert_market(session, protocol.id, asset, chain)
 
         snapshot = LendingSnapshot(
             market_id=market.id,
             observed_at=datetime.now(UTC),
             deposit_apy=float(reserve["deposit_apy"]),  # type: ignore[arg-type]
             borrow_apy=float(reserve["borrow_apy"]),  # type: ignore[arg-type]
+            reward_apy=reserve.get("reward_apy"),  # type: ignore[arg-type]
             utilization=float(reserve["utilization"]),  # type: ignore[arg-type]
             available_liquidity=float(reserve["available_liquidity"]),  # type: ignore[arg-type]
             total_supplied=float(reserve["total_supplied"]),  # type: ignore[arg-type]

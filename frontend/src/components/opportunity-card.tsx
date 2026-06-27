@@ -8,12 +8,11 @@ import {
   CardTitle,
   CardDescription,
   CardContent,
-  CardFooter,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { useCapital, yieldToDollars } from "@/lib/capital-context";
 import { fmtPct, fmtUsd } from "@/lib/utils";
-import type { LoopOpportunityOut, CarryOpportunityOut } from "@/lib/api";
+import type { OpportunityOut } from "@/lib/api";
 
 // ── Risk band (single source of truth, exported for tasks 08/11) ────────────
 
@@ -66,24 +65,37 @@ function renderStars(rating: number | null | undefined): string {
 
 // ── Props ──────────────────────────────────────────────────────────────────
 
+const STRATEGY_BADGE: Record<string, string> = {
+  loop: "Loop",
+  carry: "Carry",
+  stable_lending: "Stable Lending",
+  staking: "Staking",
+  restaking: "Restaking",
+  pendle: "Pendle",
+  cross_protocol: "Cross-Protocol",
+};
+
 export type OpportunityCardProps = {
-  opportunity: LoopOpportunityOut | CarryOpportunityOut;
-  kind: "loop" | "carry";
-  onOpenDetail?: (opp: LoopOpportunityOut | CarryOpportunityOut) => void;
+  opportunity: OpportunityOut;
+  /** @deprecated — kept for backward compat; ignored if strategy_type is set */
+  kind?: "loop" | "carry";
+  onOpenDetail?: (opp: OpportunityOut) => void;
 };
 
 // ── Component ──────────────────────────────────────────────────────────────
 
-export default function OpportunityCard({ opportunity: opp, kind, onOpenDetail }: OpportunityCardProps) {
+export default function OpportunityCard({ opportunity: opp, onOpenDetail }: OpportunityCardProps) {
   const [expanded, setExpanded] = useState(false);
   const { capital } = useCapital();
 
-  const isLoop = kind === "loop";
-  const loop = isLoop ? (opp as LoopOpportunityOut) : null;
+  const strategyType = opp.strategy_type;
+  const isLoop = strategyType === "loop";
+  const isCarry = strategyType === "carry";
+  const strategyBadge = STRATEGY_BADGE[strategyType] ?? strategyType;
+  const d = opp.strategy_details ?? {};
 
-  const yieldPct = isLoop
-    ? (opp as LoopOpportunityOut).effective_yield
-    : (opp as CarryOpportunityOut).net_carry;
+  // Loop → effective_yield; carry → net_carry; others → net_apy
+  const yieldPct = isLoop ? d.effective_yield : isCarry ? d.net_carry : opp.net_apy;
 
   const dollars = yieldPct != null ? yieldToDollars(yieldPct, capital) : null;
 
@@ -100,7 +112,7 @@ export default function OpportunityCard({ opportunity: opp, kind, onOpenDetail }
           <div>
             <CardTitle className="flex items-center gap-2">
               <span>
-                {isLoop ? "Loop" : "Carry"} / {opp.protocol} / {opp.asset}
+                {strategyBadge} / {opp.protocol} / {opp.asset}
               </span>
               {opp.medal && <span>{opp.medal}</span>}
             </CardTitle>
@@ -143,24 +155,24 @@ export default function OpportunityCard({ opportunity: opp, kind, onOpenDetail }
         )}
 
         {/* ── Loop health ── */}
-        {isLoop && loop && (
+        {isLoop && (
           <div className="grid grid-cols-3 gap-2 text-sm">
             <div>
               <div className="text-xs text-muted-foreground">Current LTV</div>
-              <div>{loop.leverage != null ? loop.leverage.toFixed(2) + "x" : "—"}</div>
+              <div>{d.leverage != null ? Number(d.leverage).toFixed(2) + "x" : "—"}</div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Safety Margin</div>
               <div>
-                {getHealthEmoji(loop.safety_margin)}{" "}
-                {loop.safety_margin != null ? (loop.safety_margin * 100).toFixed(1) + "%" : "—"}
+                {getHealthEmoji(d.safety_margin)}{" "}
+                {d.safety_margin != null ? (Number(d.safety_margin) * 100).toFixed(1) + "%" : "—"}
               </div>
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Liq. Distance</div>
               <div>
-                {loop.liquidation_distance != null
-                  ? (loop.liquidation_distance * 100).toFixed(1) + "%"
+                {d.liquidation_distance != null
+                  ? (Number(d.liquidation_distance) * 100).toFixed(1) + "%"
                   : "—"}
               </div>
             </div>
@@ -224,13 +236,13 @@ export default function OpportunityCard({ opportunity: opp, kind, onOpenDetail }
                 </div>
 
                 {/* Loop math */}
-                {isLoop && loop && (
+                {isLoop && (
                   <div>
                     <div className="mb-1 font-medium">Loop math</div>
                     <div className="space-y-0.5 text-muted-foreground">
-                      <div>Deposit APY: {fmtPct((opp as LoopOpportunityOut).deposit_apy)}</div>
-                      <div>Borrow APY: {fmtPct((opp as LoopOpportunityOut).borrow_apy)}</div>
-                      <div>Leverage: {loop.leverage != null ? loop.leverage.toFixed(2) + "x" : "—"}</div>
+                      <div>Deposit APY: {fmtPct(d.deposit_apy)}</div>
+                      <div>Borrow APY: {fmtPct(d.borrow_apy)}</div>
+                      <div>Leverage: {d.leverage != null ? Number(d.leverage).toFixed(2) + "x" : "—"}</div>
                       <div className="font-medium text-foreground">
                         → Net yield: {fmtPct(yieldPct)}
                       </div>
@@ -239,17 +251,31 @@ export default function OpportunityCard({ opportunity: opp, kind, onOpenDetail }
                 )}
 
                 {/* Carry math */}
-                {!isLoop && (
+                {isCarry && (
                   <div>
                     <div className="mb-1 font-medium">Carry math</div>
                     <div className="space-y-0.5 text-muted-foreground">
-                      <div>Funding yield: {fmtPct((opp as CarryOpportunityOut).funding_yield)}</div>
-                      <div>Spot yield: {fmtPct((opp as CarryOpportunityOut).spot_yield)}</div>
-                      <div>Borrow cost: {fmtPct((opp as CarryOpportunityOut).borrow_cost)}</div>
-                      <div>Trading fees: {fmtPct((opp as CarryOpportunityOut).trading_fees)}</div>
+                      <div>Funding yield: {fmtPct(d.funding_yield)}</div>
+                      <div>Spot yield: {fmtPct(d.spot_yield)}</div>
+                      <div>Borrow cost: {fmtPct(d.borrow_cost)}</div>
+                      <div>Trading fees: {fmtPct(d.trading_fees)}</div>
                       <div className="font-medium text-foreground">
                         → Net carry: {fmtPct(yieldPct)}
                       </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Generic strategy details for other types */}
+                {!isLoop && !isCarry && Object.keys(d).length > 0 && (
+                  <div>
+                    <div className="mb-1 font-medium">{strategyBadge} details</div>
+                    <div className="space-y-0.5 text-muted-foreground">
+                      {Object.entries(d).map(([key, val]) => (
+                        <div key={key}>
+                          {key.replace(/_/g, " ")}: {val != null ? fmtPct(val) : "—"}
+                        </div>
+                      ))}
                     </div>
                   </div>
                 )}

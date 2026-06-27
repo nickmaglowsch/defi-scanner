@@ -12,13 +12,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.calculations.carry import calculate_carry
+from app.calculations.cross_protocol import calculate_cross_protocol_spread
 from app.calculations.looping import simulate_looping
 from app.models import (
     CarryCalculation,
+    CrossProtocolCalculation,
     FundingSnapshot,
     LendingSnapshot,
     LoopCalculation,
     Market,
+    Protocol,
 )
 
 logger = logging.getLogger("defi_scanner")
@@ -43,11 +46,16 @@ def ltv_params_from_snapshot(snapshot: LendingSnapshot) -> tuple[float, float]:
     return max_ltv, liq
 
 
+# Market types that have no borrow leg — loop simulation is meaningless for these.
+_NO_BORROW_LEG_MARKET_TYPES = frozenset({"staking", "restaking", "pendle", "stable_lending"})
+
+
 async def trigger_loop_calculation(session: AsyncSession, snapshot: LendingSnapshot) -> None:
     """Run simulate_looping on a fresh lending snapshot and persist the result.
 
     Idempotent: skips if a LoopCalculation already exists for this
     snapshot_id with calc_version 'loop-v1'.
+    Skips market types with no borrow leg (staking, restaking, pendle, stable_lending).
     """
     existing = await session.execute(
         select(LoopCalculation).where(
@@ -60,6 +68,15 @@ async def trigger_loop_calculation(session: AsyncSession, snapshot: LendingSnaps
 
     market = await session.get(Market, snapshot.market_id)
     if market is None:
+        return
+
+    # ponytail: skip loop simulation for no-borrow-leg market types
+    if market.market_type in _NO_BORROW_LEG_MARKET_TYPES:
+        logger.debug(
+            "Skipping loop calculation for market %s (market_type=%s has no borrow leg)",
+            market.id,
+            market.market_type,
+        )
         return
 
     max_ltv, liq_threshold = ltv_params_from_snapshot(snapshot)
@@ -157,3 +174,82 @@ async def trigger_carry_calculation(session: AsyncSession, snapshot: FundingSnap
     )
     session.add(row)
     logger.debug("Carry calculation persisted for snapshot %s", snapshot.id)
+
+
+async def trigger_cross_protocol_calculation(
+    session: AsyncSession,
+    snapshot: LendingSnapshot,
+) -> None:
+    """Find the best cross-protocol pair for the snapshot's asset and persist the result.
+
+    Same-asset only (deposit on one protocol, borrow on another).
+    Idempotent: skips if a CrossProtocolCalculation already exists for this
+    (deposit_market_id, borrow_market_id) pair with calc_version 'cross-protocol-v1'.
+    """
+    market = await session.get(Market, snapshot.market_id)
+    if market is None:
+        return
+
+    # Find all lending markets for the same asset on different protocols.
+    same_asset_markets_q = (
+        select(Market.id, Market.protocol_id)
+        .where(Market.asset == market.asset, Market.id != market.id, Market.market_type == "lending")
+    )
+    result = await session.execute(same_asset_markets_q)
+    other_markets = result.all()
+
+    if not other_markets:
+        return
+
+    # Collect protocol names for risk scoring (cross-chain gets extra penalty).
+    deposit_protocol = await session.get(Protocol, market.protocol_id)
+
+    for other_market_id, other_protocol_id in other_markets:
+        # Idempotency: skip if already computed.
+        existing = await session.execute(
+            select(CrossProtocolCalculation).where(
+                CrossProtocolCalculation.deposit_market_id == snapshot.market_id,
+                CrossProtocolCalculation.borrow_market_id == other_market_id,
+                CrossProtocolCalculation.calc_version == "cross-protocol-v1",
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            continue
+
+        # Get latest lending snapshot for the borrow market.
+        borrow_snap_q = (
+            select(LendingSnapshot)
+            .where(LendingSnapshot.market_id == other_market_id)
+            .order_by(LendingSnapshot.observed_at.desc())
+            .limit(1)
+        )
+        borrow_snap_result = await session.execute(borrow_snap_q)
+        borrow_snap = borrow_snap_result.scalar_one_or_none()
+        if borrow_snap is None:
+            continue
+
+        max_ltv, liq_threshold = ltv_params_from_snapshot(snapshot)
+        calc = calculate_cross_protocol_spread(
+            deposit_apy=snapshot.deposit_apy or 0.0,
+            borrow_apy=borrow_snap.borrow_apy or 0.0,
+            max_ltv=max_ltv,
+            liq_threshold=liq_threshold,
+        )
+
+        row = CrossProtocolCalculation(
+            deposit_market_id=snapshot.market_id,
+            borrow_market_id=other_market_id,
+            calc_version="cross-protocol-v1",
+            deposit_apy=snapshot.deposit_apy,
+            borrow_apy=borrow_snap.borrow_apy,
+            net_spread=calc["net_spread"],
+            leverage=calc["leverage"],
+            risk_score=calc["risk_score"],
+            penalty_breakdown={"cross_protocol_penalty": 0.5},
+        )
+        session.add(row)
+        logger.debug(
+            "Cross-protocol calculation persisted: deposit=%s borrow=%s",
+            snapshot.market_id,
+            other_market_id,
+        )

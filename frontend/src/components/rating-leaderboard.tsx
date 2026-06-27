@@ -10,15 +10,25 @@ import {
 } from "@/components/ui/table";
 import { getRiskLabel, getRiskColor } from "@/components/opportunity-card";
 import { useCapital, yieldToDollars } from "@/lib/capital-context";
-import { isLoop, oppYield } from "@/lib/api";
-import type { LoopOpportunityOut, CarryOpportunityOut } from "@/lib/api";
+import { oppYield } from "@/lib/api";
+import type { OpportunityOut } from "@/lib/api";
 import { useOpportunities } from "@/lib/opportunities-context";
 import { fmtPct, fmtUsd } from "@/lib/utils";
 
-type Opp = LoopOpportunityOut | CarryOpportunityOut;
+type Opp = OpportunityOut;
+
+const STRATEGY_LABEL: Record<string, string> = {
+  loop: "Loop",
+  carry: "Carry",
+  stable_lending: "Stable Lending",
+  staking: "Staking",
+  restaking: "Restaking",
+  pendle: "Pendle",
+  cross_protocol: "Cross-Protocol",
+};
 
 function strategyLabel(opp: Opp): string {
-  const type = isLoop(opp) ? "Loop" : "Carry";
+  const type = STRATEGY_LABEL[opp.strategy_type] ?? opp.strategy_type;
   return `${opp.protocol} ${opp.asset} ${type}`;
 }
 

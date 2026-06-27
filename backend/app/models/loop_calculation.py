@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy import DateTime, Float, Integer, String, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -30,3 +31,4 @@ class LoopCalculation(Base):
     safety_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
     liquidation_distance: Mapped[float | None] = mapped_column(Float, nullable=True)
     risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    penalty_breakdown: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

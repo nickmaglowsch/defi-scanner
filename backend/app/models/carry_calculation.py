@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy import DateTime, Float, String, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -26,3 +27,4 @@ class CarryCalculation(Base):
     net_carry: Mapped[float | None] = mapped_column(Float, nullable=True)
     risk_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     expected_annual_return: Mapped[float | None] = mapped_column(Float, nullable=True)
+    penalty_breakdown: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

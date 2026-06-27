@@ -53,19 +53,16 @@ export interface YieldHistoryOut {
   avg_30d: number | null;
 }
 
-export interface LoopOpportunityOut {
+/** Generic opportunity schema with strategy_type discriminator. */
+export interface OpportunityOut {
+  strategy_type: "loop" | "carry" | string;
   protocol: string;
   asset: string;
-  deposit_apy: number | null;
-  borrow_apy: number | null;
-  effective_yield: number | null;
-  leverage: number | null;
-  safety_margin: number | null;
-  liquidation_distance: number | null;
+  chain?: string | null;
+  net_apy: number | null;
   risk_score: number | null;
   score: number;
   rank: number;
-  // Task-04 enrichment fields
   market_id?: string | null;
   breakdown?: Record<string, number> | null;
   weights?: Record<string, number> | null;
@@ -75,48 +72,32 @@ export interface LoopOpportunityOut {
   medal?: string | null;
   sharpe?: number | null;
   history?: YieldHistoryOut | null;
+  /** Strategy-specific fields (loop leverage, carry funding yield, etc.) */
+  strategy_details: Record<string, number | null>;
+  // Task-10 future fields
+  percentile_90d?: number | null;
+  historical_rank?: string | null;
 }
 
-export interface CarryOpportunityOut {
-  protocol: string;
-  asset: string;
-  funding_yield: number | null;
-  spot_yield: number | null;
-  borrow_cost: number | null;
-  trading_fees: number | null;
-  net_carry: number | null;
-  risk_score: number | null;
-  score: number;
-  rank: number;
-  // Task-04 enrichment fields
-  market_id?: string | null;
-  breakdown?: Record<string, number> | null;
-  weights?: Record<string, number> | null;
-  rating?: number | null;
-  rating_label?: string | null;
-  confidence?: number | null;
-  medal?: string | null;
-  sharpe?: number | null;
-  history?: YieldHistoryOut | null;
-}
+// ponytail: deprecated — kept so existing call-sites compile without changes.
+export type LoopOpportunityOut = OpportunityOut;
+export type CarryOpportunityOut = OpportunityOut;
 
 export interface HistoryPointOut {
   observed_at: string;
   value: number;
 }
 
-// ── Opportunity union helpers ──────────────────────────────────────────────
+// ── Opportunity helpers ───────────────────────────────────────────────────
 
-/** Discriminate a loop opportunity from a carry one. */
-export function isLoop(
-  opp: LoopOpportunityOut | CarryOpportunityOut
-): opp is LoopOpportunityOut {
-  return "effective_yield" in opp;
+/** Discriminate a loop opportunity by strategy_type. */
+export function isLoop(opp: OpportunityOut): boolean {
+  return opp.strategy_type === "loop";
 }
 
-/** The headline yield for an opportunity: effective_yield for loops, net_carry for carries. */
-export function oppYield(opp: LoopOpportunityOut | CarryOpportunityOut): number | null {
-  return isLoop(opp) ? opp.effective_yield : opp.net_carry;
+/** The headline yield: net_apy (unified field) — falls back to strategy_details. */
+export function oppYield(opp: OpportunityOut): number | null {
+  return opp.net_apy;
 }
 
 // ── Generic fetch wrapper ─────────────────────────────────────────────────
@@ -155,8 +136,8 @@ export interface OppParams {
 }
 export async function getOpportunities(
   params?: OppParams
-): Promise<(LoopOpportunityOut | CarryOpportunityOut)[]> {
-  return fetchAPI<(LoopOpportunityOut | CarryOpportunityOut)[]>(
+): Promise<OpportunityOut[]> {
+  return fetchAPI<OpportunityOut[]>(
     "/api/v1/opportunities",
     params as Record<string, string | number>
   );
@@ -171,8 +152,8 @@ export interface LoopParams {
 }
 export async function getLooping(
   params?: LoopParams
-): Promise<LoopOpportunityOut[]> {
-  return fetchAPI<LoopOpportunityOut[]>("/api/v1/looping", params as Record<string, string | number>);
+): Promise<OpportunityOut[]> {
+  return fetchAPI<OpportunityOut[]>("/api/v1/looping", params as Record<string, string | number>);
 }
 
 export interface FundingParams {

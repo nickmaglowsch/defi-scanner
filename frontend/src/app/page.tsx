@@ -7,9 +7,9 @@ import RatingLeaderboard from "@/components/rating-leaderboard";
 import OpportunityFeed from "@/components/opportunity-feed";
 import OpportunityDetail from "@/components/opportunity-detail";
 import { OpportunitiesProvider } from "@/lib/opportunities-context";
-import type { LoopOpportunityOut, CarryOpportunityOut } from "@/lib/api";
+import type { OpportunityOut } from "@/lib/api";
 
-type AnyOpp = LoopOpportunityOut | CarryOpportunityOut;
+type AnyOpp = OpportunityOut;
 
 export default function Home() {
   const [selectedOpp, setSelectedOpp] = useState<AnyOpp | null>(null);
